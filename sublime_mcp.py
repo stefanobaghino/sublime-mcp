@@ -40,8 +40,9 @@ knows about, etc.
 
 ## What's in scope
 
-The snippet runs on ST's main thread, so all `sublime` API calls are
-safe. The following names are preloaded:
+The snippet runs on ST's async worker thread (`sublime.set_timeout_async`),
+so it can wait on file loads and build panels without deadlocking ST's
+UI. The following names are preloaded:
 
 - `sublime`, `sublime_plugin` — the ST Python API modules.
 - `scope_at(path, row, col) -> str` — opens the file, returns
@@ -111,8 +112,11 @@ print(v.file_name(), v.sel()[0], v.scope_name(v.sel()[0].a))
 
 ## Gotchas
 
-- The snippet runs on the main thread and blocks it for its duration.
-  Keep snippets fast. Hard timeout is 60 s.
+- Hard timeout per call is 60 s.
+- The snippet runs on ST's async worker thread. Most of the ST API is
+  thread-safe, but a few mutating operations (`TextCommand` edit tokens)
+  require the main thread — call `sublime.set_timeout(lambda: ..., 0)`
+  from within the snippet if you need that, and poll for completion.
 - File paths must be absolute for `scope_at` / `run_syntax_tests` /
   `open_view`. `find_resources` uses ST's `Packages/...` virtual paths.
 - `run_syntax_tests` is async inside ST; this helper polls the build
@@ -188,8 +192,8 @@ def run_syntax_tests(path, poll_timeout=15.0):
 '''
 
 
-def _exec_on_main_thread(code):
-    """Run `code` on ST's main thread and collect output.
+def _exec_on_worker(code):
+    """Run `code` on ST's async worker thread and collect output.
 
     Returns a dict with keys `ok`, `output`, `result`, `error`.
     """
@@ -225,7 +229,12 @@ def _exec_on_main_thread(code):
             result["output"] = buf_out.getvalue()
             done.set()
 
-    sublime.set_timeout(run, 0)
+    # Dispatch on ST's async worker thread, not the main UI thread. Snippets
+    # typically wait on ST state (file loads, build panels), and waiting on
+    # the main thread would deadlock — ST's event loop couldn't progress.
+    # Most of the ST API is thread-safe; the async thread is the documented
+    # home for long-running plugin work.
+    sublime.set_timeout_async(run, 0)
     if not done.wait(EXEC_TIMEOUT_SECONDS):
         return {
             "ok": False,
@@ -296,7 +305,7 @@ def _dispatch(message):
                 "id": req_id,
                 "error": {"code": -32602, "message": "arguments.code must be a string"},
             }
-        outcome = _exec_on_main_thread(code)
+        outcome = _exec_on_worker(code)
         text = json.dumps(outcome, indent=2, default=str)
         return {
             "jsonrpc": "2.0",
