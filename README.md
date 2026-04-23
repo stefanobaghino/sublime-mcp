@@ -84,9 +84,18 @@ resources. Agents should read it as their primary reference.
 
 ## Tests
 
-One smoke test that pings the MCP endpoint over loopback. Runs inside
-Sublime Text via the [UnitTesting](https://github.com/SublimeText/UnitTesting)
-package, both locally and in CI.
+Two suites, both running inside Sublime Text via the
+[UnitTesting](https://github.com/SublimeText/UnitTesting) package:
+
+- [`tests/test_smoke.py`](tests/test_smoke.py) pings the MCP endpoint
+  over loopback and confirms `initialize` round-trips.
+- [`tests/test_helpers.py`](tests/test_helpers.py) covers the helper
+  surface exposed inside `exec_sublime_python`: response shape (outer
+  `ok` dropped, `error` populated on exception), `scope_at` vs
+  `scope_at_test` on extension-less files, `resolve_position`'s
+  overflow / clamped matrix, `run_syntax_tests` via
+  `sublime_api.run_syntax_test` and the build-panel fallback, and
+  `_to_resource_path` edge cases.
 
 ### Locally
 
