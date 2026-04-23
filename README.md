@@ -1,5 +1,7 @@
 # sublime-mcp
 
+[![tests](https://github.com/stefanobaghino/sublime-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/stefanobaghino/sublime-mcp/actions/workflows/tests.yml)
+
 A [Sublime Text](https://www.sublimetext.com/) plugin that is also an
 [MCP](https://modelcontextprotocol.io/) server. It exposes ST's Python API
 to AI agents so they can query scopes, run syntax tests, reload syntax
@@ -79,6 +81,37 @@ Should return ST's build number in the `output` field.
 The tool's own `description` (readable via `tools/list`) is a cookbook of
 common recipes — scope-at, run syntax tests, reload a syntax file, list
 resources. Agents should read it as their primary reference.
+
+## Tests
+
+One smoke test that pings the MCP endpoint over loopback. Runs inside
+Sublime Text via the [UnitTesting](https://github.com/SublimeText/UnitTesting)
+package, both locally and in CI.
+
+### Locally
+
+UnitTesting discovers `tests/` at the package root, so the repo needs to
+be installed as its own package (rather than the single-file `Packages/User`
+symlink from [Install](#install)):
+
+```sh
+ln -s ~/Projects/github.com/stefanobaghino/sublime-mcp \
+      "$HOME/Library/Application Support/Sublime Text/Packages/sublime-mcp"
+```
+
+Remove the `Packages/User/sublime_mcp.py` symlink first if you have one —
+two copies would fight for port 47823.
+
+Install the **UnitTesting** package via Package Control, then run
+**UnitTesting: Test Current Package** from the Command Palette with any
+file from the repo active. Expected: `1 test … OK`.
+
+### CI
+
+[`.github/workflows/tests.yml`](.github/workflows/tests.yml) runs the
+suite on `ubuntu-latest` and `macOS-latest` via
+[`SublimeText/UnitTesting/actions`](https://github.com/SublimeText/UnitTesting)
+for every push and pull request.
 
 ## Security
 
