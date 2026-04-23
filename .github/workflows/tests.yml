@@ -1,0 +1,21 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  run-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macOS-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: SublimeText/UnitTesting/actions/setup@v1
+        with:
+          sublime-text-version: 4
+          install-package-control: false
+      - uses: SublimeText/UnitTesting/actions/run-tests@v1
