@@ -158,6 +158,8 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
+_Last synced with issue state: 2026-04-24._
+
 - **#4** — strict `FAILED:` regex in the build-panel fallback (currently a loose line-prefix match).
 - **#5** — populated-output test for the fallback path (blocked by #4).
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
