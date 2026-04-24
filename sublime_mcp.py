@@ -33,10 +33,10 @@ SERVER_VERSION = "0.1.0"
 
 
 TOOL_DESCRIPTION = """\
-Run Python inside Sublime Text's plugin host (Python 3.8) and get its
-output back. Use this to answer "what does ST actually do" questions:
-scope at a cursor, whether a syntax test passes, what resources ST
-knows about, etc.
+Query Sublime Text for ground-truth answers about scopes, syntax
+resolution, or syntax-test outcomes. Backed by ST's Python plugin
+host (3.8) — run arbitrary Python against a live ST instance and
+capture its output.
 
 ## What's in scope
 
