@@ -243,6 +243,11 @@ print(v.file_name(), v.sel()[0], v.scope_name(v.sel()[0].a))
   APIs before; if this one disappears the build-panel fallback takes
   over automatically, but callers will see a behaviour shift (timing,
   panel-scrape edge cases) without warning.
+
+## Companion skill
+
+A Claude Code skill with workflow recipes for this tool is bundled at
+`skills/sublime-mcp/SKILL.md` in the sublime-mcp repo.
 """
 
 
