@@ -66,6 +66,19 @@ Or add directly to `~/.claude.json`:
 }
 ```
 
+## Install the skill (optional, Claude Code only)
+
+A [skill](https://docs.claude.com/en/docs/claude-code/skills) is bundled
+at [`skills/sublime-mcp/`](./skills/sublime-mcp/SKILL.md) with workflow
+guidance — when to reach for `scope_at` vs `scope_at_test`, how to
+branch on `run_syntax_tests` summary sentinels, the three-step
+divergence triage for comparing another parser's output against ST.
+Install by symlinking it into the user-scope skills directory:
+
+```sh
+ln -s "$PWD/skills/sublime-mcp" ~/.claude/skills/sublime-mcp
+```
+
 ## Verify
 
 ```sh
