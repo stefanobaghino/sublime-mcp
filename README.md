@@ -79,6 +79,8 @@ Install by symlinking it into the user-scope skills directory:
 ln -s "$PWD/skills/sublime-mcp" ~/.claude/skills/sublime-mcp
 ```
 
+Or `cp -R skills/sublime-mcp ~/.claude/skills/sublime-mcp` if symlinks misbehave on your platform.
+
 ## Verify
 
 ```sh
