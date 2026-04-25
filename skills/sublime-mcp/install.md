@@ -67,6 +67,40 @@ curl -s -X POST http://127.0.0.1:47823/mcp \
 open -a "Sublime Text"
 ```
 
+## Verifying symlinked-package URI resolution
+
+`_to_resource_path` reverse-maps a path under a symlinked entry of `sublime.packages_path()` (e.g. `testdata/Packages/Markdown` symlinked as `~/Library/.../Packages/Markdown`) to a `Packages/<symlink_name>/...` URI that ST's resource indexer agrees on. To verify end-to-end against your real ST install:
+
+> **Warning:** this recipe creates a symlink in your real ST Packages directory. Step 3 removes it. If you skip cleanup, ST's resource indexer keeps treating the target as a registered package across sessions until you manually `unlink` it. The recipe uses a deliberately unique symlink name (`__sublime_mcp_verify__`) so it cannot collide with any real package or shadow ST's bundled syntax handling.
+
+macOS paths shown — adjust for Linux's `~/.config/sublime-text/Packages/` or your platform's equivalent.
+
+```bash
+# Step 1. Pre-check (recovers from a prior interrupted run; -L matches
+# only symlinks, so it cannot clobber a real package), then create.
+[ -L ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__ ] && \
+  unlink ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
+ln -s /path/to/your/Packages/Markdown \
+      ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
+
+# Step 2. Call run_syntax_tests with the *target path* — the input form
+# that triggered <no build panel found> on pre-fix code. The symlink-
+# walk now reverse-maps it to Packages/__sublime_mcp_verify__/...
+curl -s -X POST http://127.0.0.1:47823/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"r = run_syntax_tests(\"/path/to/your/Packages/Markdown/tests/syntax_test_markdown.md\"); print(r[\"summary\"])"}}}'
+# Success: `summary` is a numeric "N assertions passed" or
+# "FAILED: M of N assertions failed". Explicitly NOT
+# "<no build panel found>" (the API path didn't fire — _to_resource_path
+# returned None) and NOT "<resource not indexed by Sublime Text>" (the
+# API path ran but ST's resource indexer disagreed with the
+# reconstructed URI).
+
+# Step 3. Cleanup (do not skip). unlink, NOT rm -r / rm -rf — those
+# follow the symlink and would delete the target's contents.
+unlink ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
+```
+
 ## If Claude Code can't see the server
 
 ```bash

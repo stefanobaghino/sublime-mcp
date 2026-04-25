@@ -611,8 +611,12 @@ class TestToResourcePathSymlinked(HelperTestBase):
         )
 
     def test_outside_packages_target_path_returns_none(self):
-        # Negative case: a tempdir not symlinked into packages_root
-        # should not false-positive on the symlink-walk.
+        # Negative case. The class's own symlink (__sublime_mcp_test_
+        # symlink__) is in place during this test, so the assertion is
+        # the stronger "no false-positive against ANY symlink in
+        # packages_root" — not merely "no symlink → None". Locks intent
+        # against a future reader who assumes packages_root is empty
+        # at test time.
         unrelated = tempfile.mkdtemp(prefix="sublime_mcp_test_unrelated_")
         self.addCleanup(shutil.rmtree, unrelated, ignore_errors=True)
         unrelated_input = os.path.join(unrelated, "foo.md")
