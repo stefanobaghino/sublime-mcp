@@ -400,9 +400,20 @@ def find_resources(pattern):
 
 def _to_resource_path(path):
     # sublime_api.run_syntax_test only accepts resource paths of the form
-    # "Packages/...". For abs paths under sublime.packages_path(), strip
-    # the prefix and re-prepend "Packages". Returns None if the path
-    # isn't under the Packages tree; caller decides whether to fall back.
+    # "Packages/...". Three cases:
+    # 1. Already in resource form: passthrough.
+    # 2. Filesystem path under sublime.packages_path() directly (or via
+    #    a symlink-name path like ~/.../Packages/Markdown/foo.md):
+    #    strip the prefix. abspath preserves the symlink-name path so
+    #    relpath against packages_root produces a clean result.
+    # 3. Filesystem path under a realpath target reached by a symlink in
+    #    packages_root: walk symlinks, realpath each, reverse-map. ST
+    #    indexes resources by the symlink name, so the URI must use the
+    #    symlink name even when the input is the realpath target. realpath
+    #    both sides so platform symlink chains (e.g. /tmp -> /private/tmp
+    #    on macOS) don't cause a false miss.
+    # Returns None if the path isn't under the Packages tree (directly or
+    # via symlink); caller decides whether to fall back.
     if path.startswith("Packages/") or path.startswith("Packages\\"):
         return path
     packages_root = sublime.packages_path()
@@ -410,10 +421,38 @@ def _to_resource_path(path):
     try:
         rel = _os.path.relpath(abs_path, packages_root)
     except ValueError:
+        rel = None
+    if rel is not None and not rel.startswith("..") and not _os.path.isabs(rel):
+        return "Packages/" + rel.replace(_os.sep, "/")
+    # Don't cache the listing: developers commonly add/remove symlinks in
+    # packages_path() while iterating on a package, and a stale cache
+    # would silently return wrong URIs (or None for a newly-added
+    # symlink). One listdir on a small directory is cheap; correctness
+    # wins.
+    try:
+        entries = _os.listdir(packages_root)
+    except OSError:
         return None
-    if rel.startswith("..") or _os.path.isabs(rel):
-        return None
-    return "Packages/" + rel.replace(_os.sep, "/")
+    abs_path_real = _os.path.realpath(abs_path)
+    for name in entries:
+        entry_path = _os.path.join(packages_root, name)
+        if not _os.path.islink(entry_path):
+            continue
+        try:
+            target_real = _os.path.realpath(entry_path)
+        except OSError:
+            continue
+        if (abs_path_real == target_real
+                or abs_path_real.startswith(target_real + _os.sep)):
+            try:
+                rel_under_target = _os.path.relpath(abs_path_real, target_real)
+            except ValueError:
+                continue
+            if rel_under_target == ".":
+                return "Packages/" + name
+            return ("Packages/" + name + "/"
+                    + rel_under_target.replace(_os.sep, "/"))
+    return None
 
 
 def _run_syntax_tests_via_api(path):
