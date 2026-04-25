@@ -20,7 +20,7 @@ This skill drives the `sublime-mcp` server to get authoritative answers from Sub
 
 ## 1. Preflight — check before driving the tool
 
-If `mcp__sublime-text__exec_sublime_python` is in your toolbox, skip to §2.
+If `mcp__sublime-text__exec_sublime_python` appears anywhere in your tool surface — either listed in the deferred-tools system-reminder or already resolved in your toolbox — skip to §2.
 
 If it's missing, diagnose with:
 
