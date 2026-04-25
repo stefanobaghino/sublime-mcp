@@ -16,6 +16,7 @@ snippet (`window.open_file`, the filesystem watcher behind
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -529,3 +530,96 @@ class TestHeadlessGuard(HelperTestBase):
         self.assertIn("RuntimeError", outcome["error"])
         self.assertIn("no open window", outcome["error"])
         self.assertIn("install.md", outcome["error"])
+
+
+@unittest.skipIf(
+    sys.platform == "win32",
+    "TestToResourcePathSymlinked requires symlink creation, which "
+    "needs SeCreateSymbolicLinkPrivilege or Developer Mode on Windows. "
+    "A junction (mklink /J) workaround has subtle filesystem-semantics "
+    "differences that would weaken the test's invariants.",
+)
+class TestToResourcePathSymlinked(HelperTestBase):
+    """`_to_resource_path` must reverse-map a realpath-target input through
+    a symlink in `sublime.packages_path()`, returning a `Packages/
+    <symlink_name>/...` URI rather than `None`.
+
+    Blast-radius caveat: setUp creates a symlink under a deliberately
+    unique name (`__sublime_mcp_test_symlink__`) inside the user's real
+    `sublime.packages_path()`. While the symlink is in place, ST's
+    resource indexer treats it as a registered package — same kind of
+    host-wide mutation as `TestHeadlessGuard`'s `patch.object`, just via
+    filesystem rather than module-attribute mutation.
+
+    Cleanup discipline: the symlink is registered with `addCleanup`
+    (not `tearDown`) immediately after `os.symlink` so it fires even if
+    setUp partial-fails. A defensive `lexists`-then-`unlink` runs at
+    the *start* of setUp to recover from a prior crashed run that left
+    the symlink behind. The unique name ensures the defensive removal
+    cannot clobber a real user package.
+    """
+
+    SYMLINK_NAME = "__sublime_mcp_test_symlink__"
+
+    def setUp(self):
+        self.symlink_path = os.path.join(
+            sublime.packages_path(), self.SYMLINK_NAME
+        )
+        if os.path.lexists(self.symlink_path):
+            os.unlink(self.symlink_path)
+        self.target_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_target_")
+        self.addCleanup(shutil.rmtree, self.target_dir, ignore_errors=True)
+        with open(os.path.join(self.target_dir, "foo.md"), "w") as f:
+            f.write("# heading\n")
+        os.symlink(self.target_dir, self.symlink_path)
+        self.addCleanup(self._unlink_symlink)
+
+    def _unlink_symlink(self):
+        try:
+            os.unlink(self.symlink_path)
+        except FileNotFoundError:
+            pass
+
+    def test_symlink_path_input_returns_symlink_name_uri(self):
+        # Regression-proofing: passing the path under the symlink name
+        # already worked on pre-fix code (abspath preserves the symlink
+        # path; relpath against packages_root is clean). Locks the
+        # contract that the symlink-walk doesn't break this case.
+        symlink_input = os.path.join(self.symlink_path, "foo.md")
+        code = "print(_to_resource_path(%r))" % symlink_input
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(
+            outcome["output"].strip(),
+            "Packages/%s/foo.md" % self.SYMLINK_NAME,
+        )
+
+    def test_target_path_input_returns_symlink_name_uri(self):
+        # The bug: passing the realpath-target path falls through to None
+        # on pre-fix code (relpath against packages_root yields a `..`-
+        # laden path). After the fix the symlink-walk reverse-maps to
+        # the symlink-name URI ST's resource indexer agrees on.
+        target_input = os.path.join(self.target_dir, "foo.md")
+        code = "print(_to_resource_path(%r))" % target_input
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(
+            outcome["output"].strip(),
+            "Packages/%s/foo.md" % self.SYMLINK_NAME,
+        )
+
+    def test_outside_packages_target_path_returns_none(self):
+        # Negative case: a tempdir not symlinked into packages_root
+        # should not false-positive on the symlink-walk.
+        unrelated = tempfile.mkdtemp(prefix="sublime_mcp_test_unrelated_")
+        self.addCleanup(shutil.rmtree, unrelated, ignore_errors=True)
+        unrelated_input = os.path.join(unrelated, "foo.md")
+        with open(unrelated_input, "w") as f:
+            f.write("x\n")
+        code = "print(_to_resource_path(%r))" % unrelated_input
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "None")
