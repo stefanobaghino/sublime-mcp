@@ -27,6 +27,25 @@ Returns ST's build number in `output` on a healthy setup. Connection refused →
 
 Re-run the symlink from [`README.md#install`](../../README.md#install) and reopen ST (or save any `.py` file under `Packages/User/`) to trigger `plugin_loaded()`. The ST console should show the listening line.
 
+## If Sublime Text has no open window
+
+ST's plugin host can run while no editor window is open (the app stays alive in the background, especially on macOS). Helpers that drive views (`open_view`, `scope_at`, `scope_at_test`, `resolve_position`) raise `RuntimeError: open_view: Sublime Text has no open window` in this state. Open one:
+
+```bash
+open -a "Sublime Text"   # macOS
+subl                     # Linux/Windows, if the CLI helper is on PATH
+```
+
+To reproduce headlessness deliberately (e.g. for testing the guard end-to-end):
+
+```bash
+# Save or discard any unsaved work first — the call below is a polite
+# quit on each window and will block on the unsaved-buffer dialog. Do
+# NOT pass `saving no` (destructive, risks data loss).
+osascript -e 'tell app "Sublime Text" to close every window'
+osascript -e 'tell app "Sublime Text" to count of windows'   # → 0
+```
+
 ## If Claude Code can't see the server
 
 ```bash
