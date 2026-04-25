@@ -125,7 +125,7 @@ print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
 
 The returned dict also carries `overflow` (past-EOL request wrapped into a later row) and `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section.
 
-This workflow simplifies when #9 (accept filesystem paths directly) and #11 (echo the resolved syntax in the response) land. Until then, the symlink is the workaround; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong.
+This workflow simplifies when #22 (accept filesystem-path syntaxes in `assign_syntax_and_wait`) and #11 (echo the resolved syntax in the response) land. Until then, the symlink is the workaround for `resolve_position` and `scope_at_test`; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong. (`run_syntax_tests` does **not** need this workaround — `_to_resource_path` reverse-maps realpath-target inputs to the symlink-name URI directly, per PR #16 / #9.)
 
 ### Compare a parser's output against ST
 
@@ -169,14 +169,14 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-04-25._
+_Last synced with issue state: 2026-04-26._
 
 - **#4** — strict `FAILED:` regex in the build-panel fallback (currently a loose line-prefix match).
 - **#5** — populated-output test for the fallback path (blocked by #4).
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
-- **#9** — accept filesystem-path syntaxes (not just `Packages/...` URIs). Collapses the symlink step in recipe 3.
+- **#22** — accept filesystem-path syntaxes in `assign_syntax_and_wait` / `resolve_position`. Successor to #9 (the `run_syntax_tests` half of #9 landed in PR #16; this issue covers the `resolve_position` / `scope_at_test` half).
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
 - **#11** — echo the resolved syntax path in `resolve_position` / `scope_at_test` responses. Defends against symlink misresolution.
 
