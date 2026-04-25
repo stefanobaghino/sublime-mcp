@@ -458,7 +458,11 @@ class TestScopeAtTestHtmlComment(HelperTestBase):
         )
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
-        self.assertIn("text.html", outcome["output"])
+        # `text.html.basic` rather than `text.html`: the looser prefix
+        # would also match `text.html.markdown`, so a regression that
+        # mis-applied Markdown syntax to the HTML fixture would slip
+        # through.
+        self.assertIn("text.html.basic", outcome["output"])
 
 
 class TestHeadlessGuard(HelperTestBase):
