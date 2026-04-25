@@ -267,6 +267,13 @@ _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
 
 def open_view(path, timeout=5.0):
     window = sublime.active_window()
+    if window is None or len(sublime.windows()) == 0:
+        raise RuntimeError(
+            "open_view: Sublime Text has no open window. The plugin host is "
+            "running but headless. Launch ST with a window — e.g. "
+            "`open -a 'Sublime Text'` on macOS, `subl` on Linux/Windows — "
+            "then retry. See skills/sublime-mcp/install.md for details."
+        )
     view = window.open_file(path)
     deadline = _time.time() + timeout
     while view.is_loading() and _time.time() < deadline:
@@ -295,6 +302,10 @@ def scope_at(path, row, col):
 
 
 def assign_syntax_and_wait(view, resource_path, timeout=2.0):
+    # Invariant: `view` came from `open_view`, which refuses to return
+    # views from a headless ST (no window) — so `view.size() > 0` need
+    # not be re-asserted here. A direct caller bypassing `open_view` on
+    # a zero-size view will time out on stage 1 below.
     # ST exposes no public tokenisation-complete signal. Stage 1 waits for
     # view.settings()["syntax"] to reflect the requested path (usually one
     # tick, but guards against a typo landing silently). Stage 2 is a
