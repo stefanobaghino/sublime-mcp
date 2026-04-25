@@ -33,6 +33,8 @@ SERVER_STARTUP_POLL_INTERVAL_S = 0.1
 CALL_YIELD_INTERVAL_MS = 50
 
 HEADER = '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
+HEADER_PIPE_MD = '| SYNTAX TEST "Packages/Markdown/Markdown.sublime-syntax"\n'
+HEADER_HTML_COMMENT = '<!-- SYNTAX TEST "Packages/HTML/HTML.sublime-syntax" -->\n'
 
 
 def _post(payload, timeout=65):
@@ -416,3 +418,110 @@ class TestToResourcePath(HelperTestBase):
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "None")
+
+
+class TestScopeAtTestPipeHeader(HelperTestBase):
+    """`scope_at_test` must accept markdown's `|` comment-token header.
+    The fixture is extensionless so ST can't infer the syntax — a parser
+    failure on `|` would surface as a `text.plain` scope, not Markdown.
+    """
+
+    def setUp(self):
+        self.fixture_path = self._write_fixture(
+            "syntax_test_pipe_md", HEADER_PIPE_MD + "# heading\n"
+        )
+
+    def test_pipe_comment_header_parses(self):
+        resp = yield from _call_tool_yielding(
+            "print(scope_at_test(%r, 1, 0))" % self.fixture_path
+        )
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertIn("text.html.markdown", outcome["output"])
+
+
+class TestScopeAtTestHtmlComment(HelperTestBase):
+    """`scope_at_test` must accept HTML's `<!--` comment-token header.
+    Extensionless fixture for the same reason as the pipe-header test —
+    without that, ST would infer the syntax from the extension and a
+    broken header parser would not surface.
+    """
+
+    def setUp(self):
+        self.fixture_path = self._write_fixture(
+            "syntax_test_html_comment", HEADER_HTML_COMMENT + "<p>x</p>\n"
+        )
+
+    def test_html_comment_header_parses(self):
+        resp = yield from _call_tool_yielding(
+            "print(scope_at_test(%r, 1, 0))" % self.fixture_path
+        )
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertIn("text.html", outcome["output"])
+
+
+class TestHeadlessGuard(HelperTestBase):
+    """`open_view` raises `RuntimeError` when ST has no open window.
+
+    Both clauses of the guard (`active_window() is None` AND
+    `len(sublime.windows()) == 0`) are exercised in CI by patching
+    `sublime` module attributes via `unittest.mock.patch.object`. Each
+    test patches BOTH names, even though only one clause is under test:
+    the other patch forces the non-tested clause's predicate False so a
+    regression in the tested clause cannot be silently rescued by the
+    other (e.g., a CI environment that happens to have no real window).
+
+    Stability invariant: these tests rely on `open_view` reading
+    `sublime.active_window` / `sublime.windows` *through the module at
+    call time* (sublime_mcp.py:268-269). A future refactor that captures
+    references at module import would silently neuter both tests because
+    the patch would land on names the helper no longer reads.
+
+    Blast-radius caveat: while a `patch.object` context is active, the
+    override is process-global within the ST plugin host and visible to
+    autosave timers, indexers, concurrent MCP daemon-thread requests,
+    and ST's UI thread. Keep the patch window as narrow as possible —
+    wrap *only* the `open_view` call, not surrounding setUp / fixture
+    writes / assertions. A multi-helper patch under one context is a
+    code smell; split into smaller scoped patches instead.
+    """
+
+    GUARD_SNIPPET = (
+        "import unittest.mock\n"
+        "with unittest.mock.patch.object(sublime, 'windows', new={windows_mock}), \\\n"
+        "     unittest.mock.patch.object(sublime, 'active_window', new={aw_mock}):\n"
+        "    open_view('/tmp/sublime_mcp_headless_test')\n"
+    )
+
+    def test_open_view_raises_on_zero_windows(self):
+        # Load-bearing case: non-None active_window, len(windows()) == 0.
+        # `aw_mock=lambda: object()` forces the `is None` clause False so
+        # this test can't pass for the wrong reason in a CI environment
+        # where the harness happens to have no real window.
+        code = self.GUARD_SNIPPET.format(
+            windows_mock="lambda: []",
+            aw_mock="lambda: object()",
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        self.assertIn("no open window", outcome["error"])
+        self.assertIn("install.md", outcome["error"])
+
+    def test_open_view_raises_on_none_active_window(self):
+        # Defensive case: active_window() is None. `windows_mock=lambda:
+        # [object()]` forces the `windows() == 0` clause False so a
+        # regression in the `is None` branch cannot be rescued by the
+        # other clause.
+        code = self.GUARD_SNIPPET.format(
+            windows_mock="lambda: [object()]",
+            aw_mock="lambda: None",
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        self.assertIn("no open window", outcome["error"])
+        self.assertIn("install.md", outcome["error"])
