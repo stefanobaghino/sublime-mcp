@@ -125,7 +125,7 @@ print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
 
 The returned dict also carries `overflow` (past-EOL request wrapped into a later row) and `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section.
 
-This workflow simplifies when #22 (accept filesystem-path syntaxes in `assign_syntax_and_wait`) and #11 (echo the resolved syntax in the response) land. Until then, the symlink is the workaround for `resolve_position` and `scope_at_test`; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong. (`run_syntax_tests` does **not** need this workaround — `_to_resource_path` reverse-maps realpath-target inputs to the symlink-name URI directly, per PR #16 / #9.)
+The symlink is the workaround for `resolve_position`'s `syntax_path` parameter; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that would require helper-managed temporary symlinks (no tracked issue). `scope_at_test` is unaffected: the file's `SYNTAX TEST` header carries the URI, conventionally `Packages/...` form already. `run_syntax_tests` is unaffected post-PR #16 (`_to_resource_path` walks symlinked entries directly). #11 (orthogonal) will echo the resolved syntax in the response, defending against symlink misresolution.
 
 ### Compare a parser's output against ST
 
@@ -176,7 +176,7 @@ _Last synced with issue state: 2026-04-26._
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
-- **#22** — accept filesystem-path syntaxes in `assign_syntax_and_wait` / `resolve_position`. Successor to #9 (the `run_syntax_tests` half of #9 landed in PR #16; this issue covers the `resolve_position` / `scope_at_test` half).
+- **#22** — `resolve_position` `syntax_path` accepts filesystem paths (URI flexibility only — does not eliminate the `ln -s` step in §4).
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
 - **#11** — echo the resolved syntax path in `resolve_position` / `scope_at_test` responses. Defends against symlink misresolution.
 
