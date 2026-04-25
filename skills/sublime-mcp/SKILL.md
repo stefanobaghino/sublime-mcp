@@ -29,9 +29,12 @@ claude mcp list | grep sublime-text
 curl -s -X POST http://127.0.0.1:47823/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+curl -s -X POST http://127.0.0.1:47823/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"print(len(sublime.windows()))"}}}'
 ```
 
-Expected: `claude mcp list` shows `sublime-text ✓ Connected`; the curl call returns a JSON-RPC `result` with a `protocolVersion`. If either fails, point the user at `install.md` in this skill's directory. Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
+Expected: `claude mcp list` shows `sublime-text ✓ Connected`; the second call returns a JSON-RPC `result` with a `protocolVersion`; the third call's `output` is `"1\n"` or higher. If `claude mcp list` or the second call fails, point the user at `install.md` in this skill's directory. If the third call's `output` is `"0\n"`, ST's plugin host is running but headless — ask the user to open an ST window (`open -a "Sublime Text"` on macOS) before proceeding; helpers that drive views (`open_view`, `scope_at`, `scope_at_test`, `resolve_position`) raise `RuntimeError` in this state. Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
 
 ## 2. Decide whether this skill is the right call
 
@@ -74,6 +77,12 @@ print(scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8))
 print(scope_at_test("/path/to/syntax_test_git_config", 71, 28))
 ```
 
+The header parser is comment-token-agnostic — it accepts `#`, `//`, `<!--`, `;`, `--`, `|`, etc. Markdown's pipe-comment header works the same way:
+
+```python
+print(scope_at_test("/path/to/syntax_test_markdown.md", 12, 4))
+```
+
 ### Run syntax tests against a file
 
 ```python
@@ -92,6 +101,8 @@ Branch on `summary`, not on `isError` — `summary` disambiguates states that `i
 | `"<resource not indexed by Sublime Text>"` | file lives under `Packages/` but ST hasn't indexed it — check the symlink |
 | `"<no build panel found>"`                 | ST's build system produced no output panel — session-state oddity |
 | `"<no build-panel output captured>"`       | build variant ran but produced no output — rare timing issue    |
+
+If `summary` is `<no build panel found>`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — this state is a known gap tracked as #4/#5.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
@@ -158,7 +169,7 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-04-24._
+_Last synced with issue state: 2026-04-25._
 
 - **#4** — strict `FAILED:` regex in the build-panel fallback (currently a loose line-prefix match).
 - **#5** — populated-output test for the fallback path (blocked by #4).
