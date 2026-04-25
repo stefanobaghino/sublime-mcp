@@ -32,18 +32,39 @@ Re-run the symlink from [`README.md#install`](../../README.md#install) and reope
 ST's plugin host can run while no editor window is open (the app stays alive in the background, especially on macOS). Helpers that drive views (`open_view`, `scope_at`, `scope_at_test`, `resolve_position`) raise `RuntimeError: open_view: Sublime Text has no open window` in this state. Open one:
 
 ```bash
-open -a "Sublime Text"   # macOS
-subl                     # Linux/Windows, if the CLI helper is on PATH
+# macOS
+open -a "Sublime Text"
+
+# Linux: launch from your desktop entry, or invoke the binary directly
+# (often `sublime_text` or `subl` if you've set up a symlink on PATH).
+# Windows: launch via the Start menu / taskbar shortcut. There is no
+# universal CLI helper.
 ```
 
-To reproduce headlessness deliberately (e.g. for testing the guard end-to-end):
+To reproduce headlessness deliberately and verify the guard end-to-end (macOS recipe — Linux/Windows have no equivalent for AppleScript-driven window control, so verify there by quitting all windows manually instead):
 
 ```bash
-# Save or discard any unsaved work first — the call below is a polite
-# quit on each window and will block on the unsaved-buffer dialog. Do
-# NOT pass `saving no` (destructive, risks data loss).
+# Step 1. Save or discard any unsaved work — the close call below is a
+# polite per-window quit and will block on the unsaved-buffer dialog.
+# Do NOT pass `saving no` (destructive, risks data loss).
 osascript -e 'tell app "Sublime Text" to close every window'
 osascript -e 'tell app "Sublime Text" to count of windows'   # → 0
+
+# Step 2. Confirm the plugin host still sees zero windows.
+curl -s -X POST http://127.0.0.1:47823/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"print(len(sublime.windows()))"}}}'
+# Expected: response `output` contains "0\n".
+
+# Step 3. Trigger the guard. Any path works — the guard fires before
+# the file is read.
+curl -s -X POST http://127.0.0.1:47823/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"open_view(\"/tmp/anything\")"}}}'
+# Expected: response `error` contains "no open window" and "install.md".
+
+# Step 4. Recover by opening any window, then retry the original call.
+open -a "Sublime Text"
 ```
 
 ## If Claude Code can't see the server

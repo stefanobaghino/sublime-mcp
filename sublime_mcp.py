@@ -270,9 +270,9 @@ def open_view(path, timeout=5.0):
     if window is None or len(sublime.windows()) == 0:
         raise RuntimeError(
             "open_view: Sublime Text has no open window. The plugin host is "
-            "running but headless. Launch ST with a window — e.g. "
-            "`open -a 'Sublime Text'` on macOS, `subl` on Linux/Windows — "
-            "then retry. See skills/sublime-mcp/install.md for details."
+            "running but headless. Launch ST with a window (e.g. "
+            "`open -a 'Sublime Text'` on macOS) and retry. See "
+            "skills/sublime-mcp/install.md for platform-specific options."
         )
     view = window.open_file(path)
     deadline = _time.time() + timeout
