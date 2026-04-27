@@ -395,14 +395,10 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
             r = json.loads(outcome["output"])
             self.assertEqual(r["state"], "inconclusive")
             self.assertEqual(r["failures"], [])
-            # Descriptive prose rather than an empty string or a bracketed
-            # placeholder.
-            self.assertNotEqual(r["summary"], "")
-            self.assertFalse(
-                r["summary"].startswith("<"),
-                "expected descriptive prose, got bracketed placeholder %r"
-                % r["summary"],
-            )
+            # All three build-path inconclusive branches name the build
+            # variant; pin against the shared substring so a regression
+            # to generic-but-wrong prose fails the test.
+            self.assertIn("Syntax Tests build variant", r["summary"])
         finally:
             os.unlink(path)
 
