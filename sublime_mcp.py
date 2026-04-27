@@ -273,6 +273,13 @@ except ImportError:
 
 _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
 
+# ST's "Syntax Tests" build variant emits a summary line of the form
+#     FAILED: 2 of 5 assertions failed
+# right before "[Finished in Xs]". The strict pattern locks onto that
+# canonical summary; the loose fallback at the build-path return site
+# catches the case where ST's format drifts.
+_FAILED_LINE_RE = _re.compile(r"^FAILED: \d+ of \d+ assertions failed$")
+
 
 def open_view(path, timeout=5.0):
     window = sublime.active_window()
@@ -591,14 +598,19 @@ def _run_syntax_tests_via_build(path, timeout):
         if "assertions" in stripped or "FAILED" in stripped:
             summary_line = stripped
             break
-    # Loose match: any line starting with FAILED. A test file asserting
-    # FAILED-something in its own content could produce false positives;
-    # accepted tradeoff vs returning no failures at all if the format has
-    # drifted.
+    # Strict match against ST's canonical summary first; loose fallback
+    # only kicks in when the strict pattern matched nothing (format drift).
+    # The loose match has a known false-positive risk when a test fixture's
+    # own content contains "FAILED" — guarded against by trying strict first.
     failures = [
         line for line in text.splitlines()
-        if line.lstrip().startswith("FAILED")
+        if _FAILED_LINE_RE.match(line.strip())
     ]
+    if not failures:
+        failures = [
+            line for line in text.splitlines()
+            if line.lstrip().startswith("FAILED")
+        ]
     if failures:
         state = "failed"
         summary = summary_line
