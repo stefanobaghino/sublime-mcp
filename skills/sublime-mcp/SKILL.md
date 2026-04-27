@@ -102,7 +102,7 @@ Branch on `summary`, not on `isError` — `summary` disambiguates states that `i
 | `"<no build panel found>"`                 | ST's build system produced no output panel — session-state oddity |
 | `"<no build-panel output captured>"`       | build variant ran but produced no output — rare timing issue    |
 
-If `summary` is `<no build panel found>`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — this state is a known gap tracked as #4/#5.
+If `summary` is `<no build panel found>`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — this state is a known gap tracked as #17/#25.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
