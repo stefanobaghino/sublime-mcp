@@ -56,7 +56,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 - Assign to `_` inside the snippet to get its `repr` back as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`.
-- **Inner helper `ok` keys are unrelated to the top-level success signal.** `run_syntax_tests(...)["ok"]` means "did every assertion pass?", not "did the call succeed?".
+- **Helper-level status fields are unrelated to the top-level success signal.** `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed` / `inconclusive`), not whether the MCP call succeeded.
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
@@ -92,17 +92,15 @@ for msg in r["failures"]:
     print(msg)
 ```
 
-Branch on `summary`, not on `isError` — `summary` disambiguates states that `isError` collapses:
+Branch on `state`, not on `isError` — `state` disambiguates outcomes that `isError` collapses:
 
-| `summary` value                            | meaning                                                         |
-| ------------------------------------------ | --------------------------------------------------------------- |
-| `"N assertions passed"`                    | all good                                                        |
-| `"FAILED: N of M assertions failed"`       | read `failures` for specifics                                   |
-| `"<resource not indexed by Sublime Text>"` | file lives under `Packages/` but ST hasn't indexed it — check the symlink |
-| `"<no build panel found>"`                 | ST's build system produced no output panel — session-state oddity |
-| `"<no build-panel output captured>"`       | build variant ran but produced no output — rare timing issue    |
+| `state`          | meaning                                                                          | `summary` shape                                  | `failures`     |
+| ---------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | -------------- |
+| `"passed"`       | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
+| `"failed"`       | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
+| `"inconclusive"` | runner could not complete the run; assertion outcomes are unknown                | descriptive prose naming the cause               | `[]`           |
 
-If `summary` is `<no build panel found>`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — this state is a known gap tracked as #17/#25.
+If `state == "inconclusive"`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path. Causes that surface as `inconclusive` include the build-panel-missing case (tracked as #17), unindexed resources, and timeouts on a panel that produced no output.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
@@ -186,7 +184,7 @@ _Last synced with issue state: 2026-04-26._
 - `scope_at(path, row, col) -> str` — open file, return `view.scope_name` at point. Silently wrong on extension-less files.
 - `scope_at_test(path, row, col) -> str` — parse `# SYNTAX TEST` header, assign that syntax, return scope. Right for extension-less syntax-test files.
 - `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags.
-- `run_syntax_tests(path, timeout=30.0) -> dict` — run ST's built-in syntax-test runner. `{ok, summary, output, failures}`.
+- `run_syntax_tests(path, timeout=30.0) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`.
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
