@@ -378,6 +378,66 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
     """Fallback path kicks in for files outside `sublime.packages_path()`.
     The critical contract: never return a silent empty result."""
 
+    def test_failed_line_regex_discriminates_canonical_from_fixture_content(self):
+        # Direct in-namespace check on the strict regex's discrimination.
+        # Catches a regex regression even in environments where the build
+        # variant doesn't surface a panel (so the end-to-end populated-
+        # output test below skips).
+        code = (
+            "import json\n"
+            "_ = json.dumps({\n"
+            "    'canonical': bool(_FAILED_LINE_RE.match("
+            "'FAILED: 2 of 5 assertions failed')),\n"
+            "    'truncated': bool(_FAILED_LINE_RE.match('FAILED:')),\n"
+            "    'fixture_content': bool(_FAILED_LINE_RE.match("
+            "'FAILED to do something')),\n"
+            "    'passed_line': bool(_FAILED_LINE_RE.match("
+            "'5 assertions passed')),\n"
+            "})\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertTrue(r["canonical"])
+        self.assertFalse(r["truncated"])
+        self.assertFalse(r["fixture_content"])
+        self.assertFalse(r["passed_line"])
+
+    def test_failing_fixture_returns_populated_failures(self):
+        # End-to-end: drive the build path against a real failing fixture
+        # and verify populated `failures`. Skipped on sessions where ST's
+        # "Syntax Tests" build variant doesn't surface a panel — a known
+        # #17-shaped issue that produces `state == "inconclusive"`. The
+        # in-namespace regex test above covers regex regressions that
+        # would otherwise slip through this skip.
+        fd, path = tempfile.mkstemp(suffix=".py")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                f.write(HEADER)
+                f.write("x = 1\n# ^ keyword.control.flow\n")  # fails
+            code = (
+                "import json\n"
+                "_ = run_syntax_tests(%r, timeout=10.0)\n"
+                "print(json.dumps(_))\n" % path
+            )
+            resp = yield from _call_tool_yielding(code)
+            outcome = _outcome(resp)
+            self.assertIsNone(outcome["error"], outcome.get("error"))
+            r = json.loads(outcome["output"])
+            if r["state"] != "failed":
+                self.skipTest(
+                    "build path returned state=%r; populated-output "
+                    "coverage requires the Syntax Tests build variant to "
+                    "surface a panel" % r["state"]
+                )
+            self.assertGreater(len(r["failures"]), 0, r)
+            self.assertIn("FAILED", r["failures"][0])
+        finally:
+            os.unlink(path)
+
     def test_outside_packages_describes_cause(self):
         fd, path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
