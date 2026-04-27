@@ -179,7 +179,7 @@ class HelperTestBase(DeferrableTestCase):
 class TestResponseShape(HelperTestBase):
     """Outer MCP response contract: no outer `ok` field; `error is null`
     on success; `isError` tracks the presence of `error`. Distinct from
-    the inner `ok` some helpers return (e.g. `run_syntax_tests(...)["ok"]`)."""
+    helper-level status fields like `run_syntax_tests(...)["state"]`."""
 
     def test_success_has_no_outer_ok(self):
         resp = yield from _call_tool_yielding("print('hi')")
@@ -311,7 +311,7 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
             HEADER + "x = 1\n# ^ source.python\n",
         )
         r = yield from self._run(path)
-        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["state"], "passed", r)
         self.assertEqual(r["failures"], [])
         self.assertIn("assertions passed", r["summary"])
 
@@ -324,7 +324,7 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
             + "y = 2\n# ^ keyword.control.flow\n",
         )
         r = yield from self._run(path)
-        self.assertFalse(r["ok"], r)
+        self.assertEqual(r["state"], "failed", r)
         self.assertEqual(len(r["failures"]), 1, r)
         msg = r["failures"][0]
         self.assertIn("syntax_test_mix", msg)
@@ -338,12 +338,28 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
             + "x = 1\n# ^ keyword.control.flow\n",
         )
         first = yield from self._run(path)
-        self.assertFalse(first["ok"], first)
+        self.assertEqual(first["state"], "failed", first)
         self.assertEqual(len(first["failures"]), 1, first)
         for _ in range(4):
             r = yield from self._run(path)
-            self.assertEqual(r["ok"], first["ok"])
+            self.assertEqual(r["state"], first["state"])
             self.assertEqual(len(r["failures"]), len(first["failures"]))
+
+    def test_unindexed_resource_yields_inconclusive_state(self):
+        # Path under packages_path() but pointing at a package directory
+        # that doesn't exist on disk. _to_resource_path maps it to a
+        # Packages/... URI, sublime_api.run_syntax_test reports "unable
+        # to read file", _wait_for_resource times out without the
+        # resource appearing in the index, and the API path returns the
+        # inconclusive branch rather than silently falling through to
+        # the build-panel path.
+        bogus = os.path.join(
+            sublime.packages_path(), "__sublime_mcp_unindexed__", "syntax_test_nope"
+        )
+        r = yield from self._run(bogus)
+        self.assertEqual(r["state"], "inconclusive", r)
+        self.assertEqual(r["failures"], [])
+        self.assertIn("not indexed", r["summary"])
 
     def _run(self, path):
         # Generator: callers must `yield from self._run(...)`.
@@ -362,7 +378,7 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
     """Fallback path kicks in for files outside `sublime.packages_path()`.
     The critical contract: never return a silent empty result."""
 
-    def test_outside_packages_self_describes_empty(self):
+    def test_outside_packages_describes_cause(self):
         fd, path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
         try:
@@ -377,12 +393,15 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
             outcome = _outcome(resp)
             self.assertIsNone(outcome["error"], outcome.get("error"))
             r = json.loads(outcome["output"])
-            self.assertFalse(r["ok"])
+            self.assertEqual(r["state"], "inconclusive")
             self.assertEqual(r["failures"], [])
-            # Self-describing marker rather than "".
-            self.assertTrue(
-                r["summary"].startswith("<") and r["summary"].endswith(">"),
-                "expected self-describing marker, got %r" % r["summary"],
+            # Descriptive prose rather than an empty string or a bracketed
+            # placeholder.
+            self.assertNotEqual(r["summary"], "")
+            self.assertFalse(
+                r["summary"].startswith("<"),
+                "expected descriptive prose, got bracketed placeholder %r"
+                % r["summary"],
             )
         finally:
             os.unlink(path)

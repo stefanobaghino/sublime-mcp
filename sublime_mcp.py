@@ -65,17 +65,24 @@ The following names are preloaded:
   "text_point overflow" below. Optional `syntax_path` calls
   `assign_syntax_and_wait` on the view first.
 - `run_syntax_tests(path, timeout=30.0) -> dict` — returns
-  `{"ok": bool, "summary": str, "output": str, "failures": list[str]}`.
-  `ok` is True when all assertions passed. `failures` is one entry
-  per failed assertion with ST's own diagnostic (file:row:col,
-  "error: scope does not match", then the expected/actual snippet).
-  Primary path uses `sublime_api.run_syntax_test`, which returns
-  synchronously from a private ST API; falls back to the "Syntax
-  Tests" build variant for paths outside `sublime.packages_path()`.
-  The API path requires the file to live under Packages/ (either as
-  an absolute path rooted there, or the `Packages/...` resource
-  form); syntect-style investigations typically symlink the repo's
-  test dir into Packages/ for this reason.
+  `{"state": str, "summary": str, "output": str, "failures": list[str]}`.
+  `state` is one of `"passed"` (all assertions matched), `"failed"`
+  (the runner completed but some assertions did not match), or
+  `"inconclusive"` (the runner could not complete the run, so
+  assertion outcomes are unknown). `summary` is a human-readable
+  description of the state — an assertion-count headline for
+  `passed`/`failed`, descriptive prose naming the cause for
+  `inconclusive`. `failures` is one entry per failed assertion with
+  ST's own diagnostic (file:row:col, "error: scope does not match",
+  then the expected/actual snippet); populated only when
+  `state == "failed"`. Primary path uses `sublime_api.run_syntax_test`,
+  which returns synchronously from a private ST API; falls back to
+  the "Syntax Tests" build variant for paths outside
+  `sublime.packages_path()`. The API path requires the file to live
+  under Packages/ (either as an absolute path rooted there, or the
+  `Packages/...` resource form); syntect-style investigations
+  typically symlink the repo's test dir into Packages/ for this
+  reason.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -127,10 +134,10 @@ requests). The response shape is:
 {"output": str, "result": str|null, "error": str|null}
 ```
 
-`error is null` means the snippet ran to completion. Note that some
-helpers return their own dict containing an `ok` key (e.g.
-`run_syntax_tests(...)["ok"]` — "did all assertions pass?"); that
-inner `ok` is unrelated to the absence of `error` at the top level.
+`error is null` means the snippet ran to completion. Helper-level
+status (e.g. `run_syntax_tests(...)["state"]` — passed / failed /
+inconclusive) is unrelated to the absence of `error` at the top
+level.
 
 ## Recipes
 
@@ -189,17 +196,19 @@ print("overflow:", r["overflow"], "clamped:", r["clamped"], "actual:", r["actual
 
 # 3. What does ST's own assertion runner say about this file?
 r = run_syntax_tests("/path/to/Packages/Git Formats/tests/syntax_test_git_config")
-if r["ok"]:
+if r["state"] == "passed":
     print("ST passes all assertions → syntect harness diverges from ST")
-else:
+elif r["state"] == "failed":
     print("ST fails these too → test data itself has the issue:")
     for msg in r["failures"]:
         print(msg)
+else:
+    print("ST runner inconclusive →", r["summary"])
 ```
 
-Note: `run_syntax_tests(...)["ok"]` is the inner "all assertions
-passed" signal; unrelated to the top-level `error is None` success
-check on the MCP response.
+Note: `run_syntax_tests(...)["state"]` is the helper-level
+assertion-run outcome; unrelated to the top-level `error is None`
+success check on the MCP response.
 
 ### Reload a syntax file after an external edit
 
@@ -480,18 +489,22 @@ def _run_syntax_tests_via_api(path):
         # Under Packages but still not indexed: don't silently fall back to
         # the 30 s build-panel path — surface the miss to the caller.
         return {
-            "ok": False,
-            "summary": "<resource not indexed by Sublime Text>",
+            "state": "inconclusive",
+            "summary": (
+                "Sublime Text has not indexed the resource at %s" % resource
+            ),
             "output": "\n".join(messages),
             "failures": [],
         }
     failures = list(messages)
     if failures:
         summary = "FAILED: %d of %d assertions failed" % (len(failures), total)
+        state = "failed"
     else:
         summary = "%d assertions passed" % total
+        state = "passed"
     return {
-        "ok": not failures,
+        "state": state,
         "summary": summary,
         "output": "\n".join(failures) if failures else summary,
         "failures": failures,
@@ -538,8 +551,11 @@ def _run_syntax_tests_via_build(path, timeout):
                     break
     if panel is None:
         return {
-            "ok": False,
-            "summary": "<no build panel found>",
+            "state": "inconclusive",
+            "summary": (
+                "Sublime Text did not surface a build output panel for the "
+                "Syntax Tests build variant"
+            ),
             "output": "",
             "failures": [],
         }
@@ -561,8 +577,11 @@ def _run_syntax_tests_via_build(path, timeout):
     text = panel.substr(sublime.Region(0, panel.size()))
     if not saw_content:
         return {
-            "ok": False,
-            "summary": "<no build-panel output captured>",
+            "state": "inconclusive",
+            "summary": (
+                "Syntax Tests build variant produced no output before the "
+                "timeout elapsed"
+            ),
             "output": "",
             "failures": [],
         }
@@ -580,8 +599,19 @@ def _run_syntax_tests_via_build(path, timeout):
         line for line in text.splitlines()
         if line.lstrip().startswith("FAILED")
     ]
-    ok = "assertions passed" in text and not failures
-    return {"ok": ok, "summary": summary_line, "output": text, "failures": failures}
+    if failures:
+        state = "failed"
+        summary = summary_line
+    elif "assertions passed" in text:
+        state = "passed"
+        summary = summary_line
+    else:
+        state = "inconclusive"
+        summary = (
+            "Syntax Tests build variant output did not contain a parsable "
+            "assertion summary"
+        )
+    return {"state": state, "summary": summary, "output": text, "failures": failures}
 
 
 def run_syntax_tests(path, timeout=30.0):
