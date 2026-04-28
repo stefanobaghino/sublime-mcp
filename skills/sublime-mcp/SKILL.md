@@ -104,7 +104,9 @@ If `state == "inconclusive"`, fall back to the "Scope at a position" recipe (`sc
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
-`view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. To test a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), symlink it in first:
+`view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
+
+To test a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), symlink it in first:
 
 ```bash
 ln -s /path/to/repo/testdata/Packages/Java \
