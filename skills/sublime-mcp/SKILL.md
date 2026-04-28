@@ -99,7 +99,7 @@ Branch on `state` for the assertion-run outcome:
 | `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
 | `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
 
-When ST cannot complete the run, `run_syntax_tests` raises (`RuntimeError` / `TimeoutError`) and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. Known causes include the build-panel-missing case (tracked as #17), unindexed resources, and timeouts on a panel that produced no output. Fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path.
+When ST cannot complete the run, `run_syntax_tests` raises and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. Type split: `TimeoutError` for the no-output-before-deadline case; `RuntimeError` for build-panel missing (tracked as #17), unindexed resources, and unparsable build-panel output. Fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 

@@ -74,9 +74,10 @@ The following names are preloaded:
   expected/actual snippet); populated only when
   `state == "failed"`. Cases where ST cannot complete the run
   (resource not yet indexed, build-panel missing, build timeout,
-  unparsable build output) raise `RuntimeError` / `TimeoutError`
-  and surface in the top-level `error` field of the MCP response —
-  the same channel any other helper failure uses. Primary path
+  unparsable build output) raise and surface in the top-level
+  `error` field of the MCP response — the same channel any other
+  helper failure uses. `TimeoutError` for the no-output-before-
+  deadline case; `RuntimeError` for the other three. Primary path
   uses `sublime_api.run_syntax_test`, which returns synchronously
   from a private ST API; falls back to the "Syntax Tests" build
   variant for paths outside `sublime.packages_path()`. The API

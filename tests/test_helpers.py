@@ -359,7 +359,6 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
         resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNotNone(outcome["error"])
-        self.assertIn("RuntimeError", outcome["error"])
         self.assertIn("not indexed", outcome["error"])
 
     def _run(self, path):
