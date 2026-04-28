@@ -169,7 +169,7 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-04-26._
+_Last synced with issue state: 2026-04-28._
 
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
@@ -178,6 +178,9 @@ _Last synced with issue state: 2026-04-26._
 - **#24** — helper-managed temporary symlinks for repo-local syntaxes. Lands the `ln -s`-elimination half of #9's body. Once landed, the §4 workaround paragraph (and #22 / #24 entries) become removable.
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
 - **#11** — echo the resolved syntax path in `resolve_position` / `scope_at_test` responses. Defends against symlink misresolution.
+- **#30** — `run_inline_syntax_test(content, name)` lifecycle helper. Collapses the write-to-`Packages/User/`-then-poll-then-cleanup dance into one call; pairs with #24 on the on-disk side.
+- **#33** — daemon-thread `view.run_command(...)` is a silent no-op without `set_timeout`. Until the doc gotcha or `run_on_main` helper lands, callers mutating buffers from snippet code need to schedule via `set_timeout` and gate on a `threading.Event`.
+- **#34** — `find_resources` lists `Packages/...` paths whose `load_resource` raises `FileNotFoundError` (cache-survives-source case observed against `Packages/C#/Embeddings/Regex (for C#).sublime-syntax`); characterise before deciding doc vs code fix.
 
 ## 7. Reference — preloaded helpers
 
