@@ -345,21 +345,22 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
             self.assertEqual(r["state"], first["state"])
             self.assertEqual(len(r["failures"]), len(first["failures"]))
 
-    def test_unindexed_resource_yields_inconclusive_state(self):
+    def test_unindexed_resource_raises(self):
         # Path under packages_path() but pointing at a package directory
         # that doesn't exist on disk. _to_resource_path maps it to a
         # Packages/... URI, sublime_api.run_syntax_test reports "unable
         # to read file", _wait_for_resource times out without the
-        # resource appearing in the index, and the API path returns the
-        # inconclusive branch rather than silently falling through to
-        # the build-panel path.
+        # resource appearing in the index, and the API path raises
+        # rather than silently falling through to the build-panel path.
         bogus = os.path.join(
             sublime.packages_path(), "__sublime_mcp_unindexed__", "syntax_test_nope"
         )
-        r = yield from self._run(bogus)
-        self.assertEqual(r["state"], "inconclusive", r)
-        self.assertEqual(r["failures"], [])
-        self.assertIn("not indexed", r["summary"])
+        code = "_ = run_syntax_tests(%r)\n" % bogus
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        self.assertIn("not indexed", outcome["error"])
 
     def _run(self, path):
         # Generator: callers must `yield from self._run(...)`.
@@ -409,7 +410,7 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
         # End-to-end: drive the build path against a real failing fixture
         # and verify populated `failures`. Skipped on sessions where ST's
         # "Syntax Tests" build variant doesn't surface a panel — a known
-        # #17-shaped issue that produces `state == "inconclusive"`. The
+        # #17-shaped issue where run_syntax_tests now raises. The
         # in-namespace regex test above covers regex regressions that
         # would otherwise slip through this skip.
         fd, path = tempfile.mkstemp(suffix=".py")
@@ -425,14 +426,14 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
             )
             resp = yield from _call_tool_yielding(code)
             outcome = _outcome(resp)
-            self.assertIsNone(outcome["error"], outcome.get("error"))
-            r = json.loads(outcome["output"])
-            if r["state"] != "failed":
+            if outcome["error"] is not None:
                 self.skipTest(
-                    "build path returned state=%r; populated-output "
-                    "coverage requires the Syntax Tests build variant to "
-                    "surface a panel" % r["state"]
+                    "build path raised; populated-output coverage "
+                    "requires the Syntax Tests build variant to surface a "
+                    "panel: %s" % outcome["error"].splitlines()[-1]
                 )
+            r = json.loads(outcome["output"])
+            self.assertEqual(r["state"], "failed", r)
             self.assertGreater(len(r["failures"]), 0, r)
             self.assertIn("FAILED", r["failures"][0])
         finally:
@@ -444,21 +445,14 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
         try:
             with open(path, "w") as f:
                 f.write("just text\n")
-            code = (
-                "import json\n"
-                "_ = run_syntax_tests(%r, timeout=3.0)\n"
-                "print(json.dumps(_))\n" % path
-            )
+            code = "_ = run_syntax_tests(%r, timeout=3.0)\n" % path
             resp = yield from _call_tool_yielding(code)
             outcome = _outcome(resp)
-            self.assertIsNone(outcome["error"], outcome.get("error"))
-            r = json.loads(outcome["output"])
-            self.assertEqual(r["state"], "inconclusive")
-            self.assertEqual(r["failures"], [])
-            # All three build-path inconclusive branches name the build
-            # variant; pin against the shared substring so a regression
-            # to generic-but-wrong prose fails the test.
-            self.assertIn("Syntax Tests build variant", r["summary"])
+            self.assertIsNotNone(outcome["error"])
+            # All three build-path raise sites name the build variant;
+            # pin against the shared substring so a regression to
+            # generic-but-wrong prose fails the test.
+            self.assertIn("Syntax Tests build variant", outcome["error"])
         finally:
             os.unlink(path)
 
