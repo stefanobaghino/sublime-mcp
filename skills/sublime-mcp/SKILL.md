@@ -55,8 +55,8 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 ```
 
 - Assign to `_` inside the snippet to get its `repr` back as `result`.
-- `error` is populated on uncaught exception; `isError` is derived from `error is not None`.
-- **Helper-level status fields are unrelated to the top-level success signal.** `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed` / `inconclusive`), not whether the MCP call succeeded.
+- `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
+- `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
@@ -92,15 +92,14 @@ for msg in r["failures"]:
     print(msg)
 ```
 
-Branch on `state`, not on `isError` — `state` disambiguates outcomes that `isError` collapses:
+Branch on `state` for the assertion-run outcome:
 
-| `state`          | meaning                                                                          | `summary` shape                                  | `failures`     |
-| ---------------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | -------------- |
-| `"passed"`       | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
-| `"failed"`       | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
-| `"inconclusive"` | runner could not complete the run; assertion outcomes are unknown                | descriptive prose naming the cause               | `[]`           |
+| `state`     | meaning                                                                          | `summary` shape                                  | `failures`     |
+| ----------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | -------------- |
+| `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
+| `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
 
-If `state == "inconclusive"`, fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path. Causes that surface as `inconclusive` include the build-panel-missing case (tracked as #17), unindexed resources, and timeouts on a panel that produced no output.
+When ST cannot complete the run, `run_syntax_tests` raises and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. Type split: `TimeoutError` for the no-output-before-deadline case; `RuntimeError` for build-panel missing (tracked as #17), unindexed resources, and unparsable build-panel output. Fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
