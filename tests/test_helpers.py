@@ -709,3 +709,57 @@ class TestToResourcePathSymlinked(HelperTestBase):
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "None")
+
+
+class TestRunOnMain(HelperTestBase):
+    """`run_on_main` schedules a callable on ST's main thread and round-
+    trips its return value or raised exception back to the worker. The
+    load-bearing case is buffer mutation via `view.run_command(...)`,
+    which silently no-ops when called directly from the worker thread.
+    """
+
+    def test_returns_callable_result(self):
+        code = "_ = run_on_main(lambda: 42)\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "42")
+
+    def test_propagates_exception(self):
+        code = "_ = run_on_main(lambda: 1 / 0)\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ZeroDivisionError", outcome["error"])
+
+    def test_timeout_raises(self):
+        # 0.1 s budget; callable sleeps 1 s. The run_on_main TimeoutError
+        # propagates as the snippet's `error`.
+        code = (
+            "import time\n"
+            "_ = run_on_main(lambda: time.sleep(1.0), timeout=0.1)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("TimeoutError", outcome["error"])
+        self.assertIn("run_on_main", outcome["error"])
+        self.assertIn("0.1", outcome["error"])
+
+    def test_view_run_command_actually_mutates(self):
+        # The original failure mode: view.run_command on the worker
+        # thread is a silent no-op. With run_on_main the buffer should
+        # actually grow.
+        code = (
+            "v = sublime.active_window().new_file()\n"
+            "try:\n"
+            "    run_on_main(lambda: v.run_command('append', {'characters': 'hello'}))\n"
+            "    print(v.size())\n"
+            "finally:\n"
+            "    v.set_scratch(True)\n"
+            "    v.close()\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "5")

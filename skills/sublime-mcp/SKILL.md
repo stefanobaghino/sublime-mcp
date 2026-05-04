@@ -156,6 +156,19 @@ print(r["summary"])
 
 If step 3 passes, the downstream parser diverges from ST — file the bug against the parser. If step 3 fails too, the test data itself has the issue; fix the data, not the parser.
 
+### Mutate a buffer from a snippet
+
+Snippets exec on a worker thread; `view.run_command(...)` requires ST's main thread and silently no-ops if called directly. Wrap the call in `run_on_main` — it owns the `set_timeout` schedule, the completion signal, and the timeout error path.
+
+```python
+v = sublime.active_window().new_file()
+run_on_main(lambda: v.run_command("append", {"characters": "hello"}))
+print(v.size())  # 5
+v.set_scratch(True); v.close()
+```
+
+`run_on_main(callable, timeout=2.0)` returns the callable's value; exceptions raised inside the callable propagate to the worker thread (and surface as the snippet's `error`).
+
 ### Bulk probes
 
 `scope_name` on an already-tokenised view is thread-safe and runs concurrent with ST's UI, so a several-hundred-row sweep in one `exec_sublime_python` call comfortably fits the 60 s per-call budget. The cold-view cost is a one-time tokenisation pass on the first helper call against a given path.
@@ -176,7 +189,7 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-05-03._
+_Last synced with issue state: 2026-05-04._
 
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
@@ -185,7 +198,6 @@ _Last synced with issue state: 2026-05-03._
 - **#24** — helper-managed temporary symlinks for repo-local syntaxes. Lands the `ln -s`-elimination half of #9's body. Once landed, the §4 workaround paragraph (and #22 / #24 entries) become removable.
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
 - **#30** — `run_inline_syntax_test(content, name)` lifecycle helper. Collapses the write-to-`Packages/User/`-then-poll-then-cleanup dance into one call; pairs with #24 on the on-disk side.
-- **#33** — daemon-thread `view.run_command(...)` is a silent no-op without `set_timeout`. Until the doc gotcha or `run_on_main` helper lands, callers mutating buffers from snippet code need to schedule via `set_timeout` and gate on a `threading.Event`.
 - **#34** — `find_resources` lists `Packages/...` paths whose `load_resource` raises `FileNotFoundError` (cache-survives-source case observed against `Packages/C#/Embeddings/Regex (for C#).sublime-syntax`); characterise before deciding doc vs code fix.
 
 ## 7. Reference — preloaded helpers
@@ -196,6 +208,7 @@ _Last synced with issue state: 2026-05-03._
 - `run_syntax_tests(path) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`. Path must resolve under `sublime.packages_path()` (directly or via a symlink in that directory); paths outside the Packages tree raise.
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
+- `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
 
