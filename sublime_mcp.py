@@ -89,7 +89,7 @@ The following names are preloaded:
   deadline case; `RuntimeError` for the other three. Primary path
   uses `sublime_api.run_syntax_test`, which returns synchronously
   from a private ST API; falls back to the "Syntax Tests" build
-  variant for paths outside `sublime.packages_path()`. The API
+  system for paths outside `sublime.packages_path()`. The API
   path requires the file to live under Packages/ (either as an
   absolute path rooted there, or the `Packages/...` resource
   form); syntect-style investigations typically symlink the repo's
@@ -269,7 +269,7 @@ print(v.file_name(), v.sel()[0], v.scope_name(v.sel()[0].a))
   `run_syntax_tests` accepts that form too.
 - `run_syntax_tests` prefers the private `sublime_api.run_syntax_test`
   (synchronous, structured result) for files under Packages/ and
-  falls back to the "Syntax Tests" build variant otherwise. The
+  falls back to the "Syntax Tests" build system otherwise. The
   fallback polls the build panel for up to `timeout` seconds.
 - The primary `run_syntax_tests` path uses `sublime_api.run_syntax_test`,
   which is a **private, undocumented** ST API. ST has changed private
@@ -297,7 +297,7 @@ except ImportError:
 
 _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
 
-# ST's "Syntax Tests" build variant emits a summary line of the form
+# ST's "Syntax Tests" build system emits a summary line of the form
 #     FAILED: 2 of 5 assertions failed
 # right before "[Finished in Xs]". The strict pattern locks onto that
 # canonical summary; the loose fallback at the build-path return site
@@ -573,14 +573,17 @@ def _wait_for_resource(resource_path, timeout=1.0):
 
 
 def _run_syntax_tests_via_build(path, timeout):
-    # Fallback: trigger the "Syntax Tests" build variant and scrape the
+    # Fallback: trigger the "Syntax Tests" build system and scrape the
     # output panel. Used when sublime_api is unavailable or the path
     # isn't under Packages/. Addresses the original silent-empty-result
     # bug: require a non-empty read before considering the poll settled,
     # and raise a self-describing exception instead of returning "".
     window = sublime.active_window()
     open_view(path)
-    window.run_command("build", {"variant": "Syntax Tests"})
+    window.run_command(
+        "build",
+        {"build_system": "Packages/Default/Syntax Tests.sublime-build"},
+    )
     panel = None
     for name in ("exec", "syntax_test"):
         panel = window.find_output_panel(name)
@@ -596,7 +599,7 @@ def _run_syntax_tests_via_build(path, timeout):
     if panel is None:
         raise RuntimeError(
             "Sublime Text did not surface a build output panel for the "
-            "Syntax Tests build variant"
+            "Syntax Tests build system"
         )
     deadline = _time.time() + timeout
     saw_content = False
@@ -616,7 +619,7 @@ def _run_syntax_tests_via_build(path, timeout):
     text = panel.substr(sublime.Region(0, panel.size()))
     if not saw_content:
         raise TimeoutError(
-            "Syntax Tests build variant produced no output before the "
+            "Syntax Tests build system produced no output before the "
             "timeout elapsed"
         )
     summary_line = ""
@@ -646,7 +649,7 @@ def _run_syntax_tests_via_build(path, timeout):
         summary = summary_line
     else:
         raise RuntimeError(
-            "Syntax Tests build variant output did not contain a parsable "
+            "Syntax Tests build system output did not contain a parsable "
             "assertion summary"
         )
     return {"state": state, "summary": summary, "output": text, "failures": failures}

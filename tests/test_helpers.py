@@ -470,7 +470,7 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
     def test_failing_fixture_returns_populated_failures(self):
         # End-to-end: drive the build path against a real failing fixture
         # and verify populated `failures`. Skipped on sessions where ST's
-        # "Syntax Tests" build variant doesn't surface a panel — a known
+        # "Syntax Tests" build system doesn't surface a panel — a known
         # #17-shaped issue where run_syntax_tests now raises. The
         # in-namespace regex test above covers regex regressions that
         # would otherwise slip through this skip.
@@ -490,7 +490,7 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
             if outcome["error"] is not None:
                 self.skipTest(
                     "build path raised; populated-output coverage "
-                    "requires the Syntax Tests build variant to surface a "
+                    "requires the Syntax Tests build system to surface a "
                     "panel: %s" % outcome["error"].splitlines()[-1]
                 )
             r = json.loads(outcome["output"])
@@ -510,10 +510,10 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
             resp = yield from _call_tool_yielding(code)
             outcome = _outcome(resp)
             self.assertIsNotNone(outcome["error"])
-            # All three build-path raise sites name the build variant;
+            # All three build-path raise sites name the build system;
             # pin against the shared substring so a regression to
             # generic-but-wrong prose fails the test.
-            self.assertIn("Syntax Tests build variant", outcome["error"])
+            self.assertIn("Syntax Tests build system", outcome["error"])
         finally:
             os.unlink(path)
 
