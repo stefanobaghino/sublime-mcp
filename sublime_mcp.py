@@ -73,7 +73,7 @@ The following names are preloaded:
   `assign_syntax_and_wait` on the view first. Response carries
   `requested_syntax` (echo of the `syntax_path` arg, or `None`) and
   `resolved_syntax` (ST's `view.syntax().path`, or `None`).
-- `run_syntax_tests(path, timeout=30.0) -> dict` — returns
+- `run_syntax_tests(path) -> dict` — returns
   `{"state": str, "summary": str, "output": str, "failures": list[str]}`.
   `state` is one of `"passed"` (all assertions matched) or
   `"failed"` (the runner completed but some assertions did not
@@ -82,18 +82,12 @@ The following names are preloaded:
   (file:row:col, "error: scope does not match", then the
   expected/actual snippet); populated only when
   `state == "failed"`. Cases where ST cannot complete the run
-  (resource not yet indexed, build-panel missing, build timeout,
-  unparsable build output) raise and surface in the top-level
-  `error` field of the MCP response — the same channel any other
-  helper failure uses. `TimeoutError` for the no-output-before-
-  deadline case; `RuntimeError` for the other three. Primary path
-  uses `sublime_api.run_syntax_test`, which returns synchronously
-  from a private ST API; falls back to the "Syntax Tests" build
-  system for paths outside `sublime.packages_path()`. The API
-  path requires the file to live under Packages/ (either as an
-  absolute path rooted there, or the `Packages/...` resource
-  form); syntect-style investigations typically symlink the repo's
-  test dir into Packages/ for this reason.
+  (resource not yet indexed, path outside `sublime.packages_path()`,
+  private `sublime_api.run_syntax_test` missing) raise
+  `RuntimeError`, surfaced in the top-level `error` field of the
+  MCP response — the same channel any other helper failure uses.
+  Files outside Packages/ must be symlinked in (the helper walks
+  symlinks); see SKILL.md section 4.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -267,15 +261,13 @@ print(v.file_name(), v.sel()[0], v.scope_name(v.sel()[0].a))
   `resolve_position` / `run_syntax_tests` / `open_view`.
   `find_resources` uses ST's `Packages/...` virtual paths, and
   `run_syntax_tests` accepts that form too.
-- `run_syntax_tests` prefers the private `sublime_api.run_syntax_test`
-  (synchronous, structured result) for files under Packages/ and
-  falls back to the "Syntax Tests" build system otherwise. The
-  fallback polls the build panel for up to `timeout` seconds.
-- The primary `run_syntax_tests` path uses `sublime_api.run_syntax_test`,
-  which is a **private, undocumented** ST API. ST has changed private
-  APIs before; if this one disappears the build-panel fallback takes
-  over automatically, but callers will see a behaviour shift (timing,
-  panel-scrape edge cases) without warning.
+- `run_syntax_tests` uses the private `sublime_api.run_syntax_test`
+  (synchronous, structured). The path must resolve under
+  `sublime.packages_path()` (directly or via a symlink in that
+  directory); paths outside the Packages tree raise.
+  `sublime_api.run_syntax_test` is **private and undocumented**; if
+  ST removes it, `run_syntax_tests` raises rather than silently
+  degrading.
 
 ## Companion skill
 
@@ -296,13 +288,6 @@ except ImportError:
 
 
 _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
-
-# ST's "Syntax Tests" build system emits a summary line of the form
-#     FAILED: 2 of 5 assertions failed
-# right before "[Finished in Xs]". The strict pattern locks onto that
-# canonical summary; the loose fallback at the build-path return site
-# catches the case where ST's format drifts.
-_FAILED_LINE_RE = _re.compile(r"^FAILED: \d+ of \d+ assertions failed$")
 
 
 def open_view(path, timeout=5.0):
@@ -533,9 +518,8 @@ def _run_syntax_tests_via_api(path):
         _wait_for_resource(resource)
         total, messages = _sublime_api.run_syntax_test(resource)
     if _is_unable_to_read(messages):
-        # Under Packages but still not indexed: don't silently fall back to
-        # the 30 s build-panel path — surface the miss as an exception so
-        # it propagates up as the top-level MCP `error`.
+        # Under Packages but still not indexed: surface the miss as an
+        # exception so it propagates up as the top-level MCP `error`.
         raise RuntimeError(
             "Sublime Text has not indexed the resource at %s: %s"
             % (resource, "\n".join(messages))
@@ -572,101 +556,25 @@ def _wait_for_resource(resource_path, timeout=1.0):
     return False
 
 
-def _run_syntax_tests_via_build(path, timeout):
-    # Fallback: trigger the "Syntax Tests" build system and scrape the
-    # output panel. Used when sublime_api is unavailable or the path
-    # isn't under Packages/. Addresses the original silent-empty-result
-    # bug: require a non-empty read before considering the poll settled,
-    # and raise a self-describing exception instead of returning "".
-    window = sublime.active_window()
-    open_view(path)
-    window.run_command(
-        "build",
-        {"build_system": "Packages/Default/Syntax Tests.sublime-build"},
-    )
-    panel = None
-    for name in ("exec", "syntax_test"):
-        panel = window.find_output_panel(name)
-        if panel is not None:
-            break
-    if panel is None:
-        for name in window.panels():
-            short = name.split(".", 1)[1] if "." in name else name
-            if "exec" in short or "syntax_test" in short:
-                panel = window.find_output_panel(short)
-                if panel is not None:
-                    break
-    if panel is None:
+def run_syntax_tests(path):
+    # No fallback for paths outside Packages/: programmatic dispatch of
+    # the "Syntax Tests" build system surfaces an empty output panel
+    # and never fires the runner, so a fallback would be dead code.
+    # Callers must symlink outside-Packages files in (see
+    # _to_resource_path).
+    if _sublime_api is None or not hasattr(_sublime_api, "run_syntax_test"):
         raise RuntimeError(
-            "Sublime Text did not surface a build output panel for the "
-            "Syntax Tests build system"
+            "sublime_api.run_syntax_test is unavailable on this Sublime "
+            "Text build; run_syntax_tests has no working fallback"
         )
-    deadline = _time.time() + timeout
-    saw_content = False
-    last = ""
-    while _time.time() < deadline:
-        text = panel.substr(sublime.Region(0, panel.size()))
-        if text:
-            saw_content = True
-            if text == last and (
-                "assertions passed" in text
-                or "FAILED" in text
-                or "[Finished" in text
-            ):
-                break
-        last = text
-        _time.sleep(0.1)
-    text = panel.substr(sublime.Region(0, panel.size()))
-    if not saw_content:
-        raise TimeoutError(
-            "Syntax Tests build system produced no output before the "
-            "timeout elapsed"
-        )
-    summary_line = ""
-    for line in reversed(text.splitlines()):
-        stripped = line.strip()
-        if "assertions" in stripped or "FAILED" in stripped:
-            summary_line = stripped
-            break
-    # Strict match against ST's canonical summary first; loose fallback
-    # only kicks in when the strict pattern matched nothing (format drift).
-    # The loose match has a known false-positive risk when a test fixture's
-    # own content contains "FAILED" — guarded against by trying strict first.
-    failures = [
-        line for line in text.splitlines()
-        if _FAILED_LINE_RE.match(line.strip())
-    ]
-    if not failures:
-        failures = [
-            line for line in text.splitlines()
-            if line.lstrip().startswith("FAILED")
-        ]
-    if failures:
-        state = "failed"
-        summary = summary_line
-    elif "assertions passed" in text:
-        state = "passed"
-        summary = summary_line
-    else:
+    result = _run_syntax_tests_via_api(path)
+    if result is None:
         raise RuntimeError(
-            "Syntax Tests build system output did not contain a parsable "
-            "assertion summary"
+            "Path %r is not under sublime.packages_path(); symlink the "
+            "containing directory into Packages/ (see SKILL.md section 4) "
+            "and pass the symlinked path or its Packages/... URI" % path
         )
-    return {"state": state, "summary": summary, "output": text, "failures": failures}
-
-
-def run_syntax_tests(path, timeout=30.0):
-    # Primary path: sublime_api.run_syntax_test(resource_path). It returns
-    # (total_assertions, [error_messages]) synchronously, bypassing the
-    # build-panel race that the original implementation hit. Requires the
-    # file to live under sublime.packages_path().
-    # Fallback: build-panel scrape for paths outside Packages/ or if the
-    # private API disappears.
-    if _sublime_api is not None and hasattr(_sublime_api, "run_syntax_test"):
-        result = _run_syntax_tests_via_api(path)
-        if result is not None:
-            return result
-    return _run_syntax_tests_via_build(path, timeout)
+    return result
 '''
 
 
