@@ -16,7 +16,9 @@ allowed-tools: Bash, Read, Grep, Glob, mcp__sublime-text__exec_sublime_python
 
 # Sublime Text ground-truth via MCP
 
-This skill drives the `sublime-mcp` server to get authoritative answers from Sublime Text itself — what scope it assigns at a point, which `.sublime-syntax` it resolved, whether an assertion file passes ST's built-in runner — via one tool, `exec_sublime_python`, which runs Python inside ST's plugin host. The server answers at `127.0.0.1:47823` while ST is open with the plugin loaded.
+This skill drives the `sublime-mcp` server to get authoritative answers from Sublime Text itself — what scope it assigns at a point, which `.sublime-syntax` it resolved, whether an assertion file passes ST's built-in runner — via one tool, `exec_sublime_python`, which runs Python inside ST's plugin host.
+
+**Transport.** The server is a stdio MCP harness (`sublime-mcp`) that runs Sublime Text inside a Docker container. The agent's session spawns one harness process; the harness owns one container; the container runs ST + the plugin and is reclaimed when the harness exits. The agent never sees Docker — only the `mcp__sublime-text__exec_sublime_python` tool.
 
 ## 1. Preflight — check before driving the tool
 
@@ -26,15 +28,18 @@ If it's missing, diagnose with:
 
 ```bash
 claude mcp list | grep sublime-text
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"print(len(sublime.windows()))"}}}'
+docker ps --filter label=sublime-mcp-harness --format '{{.ID}} {{.Status}}'
 ```
 
-Expected: `claude mcp list` shows `sublime-text ✓ Connected`; the second call returns a JSON-RPC `result` with a `protocolVersion`; the third call's `output` is `"1\n"` or higher. If `claude mcp list` or the second call fails, point the user at `install.md` in this skill's directory. If the third call's `output` is `"0\n"`, ST's plugin host is running but headless — ask the user to open an ST window (`open -a "Sublime Text"` on macOS) before proceeding; helpers that drive views (`open_view`, `scope_at`, `scope_at_test`, `resolve_position`) raise `RuntimeError` in this state. Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
+Expected: `claude mcp list` shows `sublime-text ✓ Connected`; `docker ps` shows one running container per active agent session. If the registration is missing or shows ✗, point the user at `install.md` in this skill's directory. If the registration is healthy but the container is missing, the harness is failing to boot — read its stderr (Claude Code surfaces it in the MCP log; on the user's side, `claude mcp logs sublime-text` if available, otherwise the harness's stderr stream during connection).
+
+Common boot-time failures the harness signals on stderr (`[sublime-mcp-harness] ERROR: …`):
+
+- `docker not found on PATH` — install Docker and ensure the daemon is running.
+- `Sublime Text never opened a window` — Xvfb or licensing issue inside the container; check `docker logs <cid>`.
+- `docker build failed` — image build broke; re-run with `--rebuild` after fixing.
+
+Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
 
 ## 2. Decide whether this skill is the right call
 
@@ -48,7 +53,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 ## 3. The one tool and its contract
 
-`mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside ST's plugin host (Python 3.8) and returns:
+`mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
 
 ```json
 { "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "isError": false }
@@ -62,14 +67,16 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
+**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping.
+
 ## 4. Recipes
 
-Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`.
+Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`. Paths shown are container-side; the user typically mounts their working tree at `/work`.
 
 ### Scope at a position
 
 ```python
-r = scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8)
+r = scope_at("/work/Packages/C#/tests/syntax_test_Generics.cs", 180, 8)
 print(r["scope"], "via", r["resolved_syntax"])
 ```
 
@@ -78,21 +85,21 @@ print(r["scope"], "via", r["resolved_syntax"])
 **Landmine: extension-less syntax-test files** (`syntax_test_git_config`, no suffix) silently fall back to Plain Text via `scope_at` — `scope == "text.plain"` and `resolved_syntax == "Packages/Text/Plain text.tmLanguage"`. Use `scope_at_test` — it parses the `# SYNTAX TEST "Packages/..."` header and assigns that syntax before sampling.
 
 ```python
-r = scope_at_test("/path/to/syntax_test_git_config", 71, 28)
+r = scope_at_test("/work/syntax_test_git_config", 71, 28)
 print(r["scope"])
 ```
 
 The header parser is comment-token-agnostic — it accepts `#`, `//`, `<!--`, `;`, `--`, `|`, etc. Markdown's pipe-comment header works the same way:
 
 ```python
-r = scope_at_test("/path/to/syntax_test_markdown.md", 12, 4)
+r = scope_at_test("/work/syntax_test_markdown.md", 12, 4)
 print(r["scope"])
 ```
 
 ### Run syntax tests against a file
 
 ```python
-r = run_syntax_tests("/path/to/Packages/C#/tests/syntax_test_Generics.cs")
+r = run_syntax_tests("/work/Packages/C#/tests/syntax_test_Generics.cs")
 print(r["summary"])
 for msg in r["failures"]:
     print(msg)
@@ -129,14 +136,14 @@ Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one 
 
 `view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
 
-For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. Pass the syntax's filesystem path directly to `resolve_position` / `assign_syntax_and_wait` — the helpers reverse-map filesystem inputs through any symlink in `sublime.packages_path()` to the matching `Packages/...` URI. (Constructing the URI by hand as `"Packages/%s/Java.sublime-syntax" % name` still works.) The caller tears down via `release_packages_link`.
+For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy mounted at `/work/testdata/...`), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. Pass the syntax's filesystem path directly to `resolve_position` / `assign_syntax_and_wait` — the helpers reverse-map filesystem inputs through any symlink in `sublime.packages_path()` to the matching `Packages/...` URI. (Constructing the URI by hand as `"Packages/%s/Java.sublime-syntax" % name` still works.) The caller tears down via `release_packages_link`.
 
 ```python
-syntax_path = "/path/to/repo/testdata/Packages/Java/Java.sublime-syntax"
+syntax_path = "/work/testdata/Packages/Java/Java.sublime-syntax"
 name = temp_packages_link(syntax_path)
 try:
     r = resolve_position(
-        "/path/to/syntax_test_file", row=71, col=29,
+        "/work/syntax_test_file", row=71, col=29,
         syntax_path=syntax_path,
     )
     print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
@@ -157,18 +164,18 @@ Three-step divergence triage:
 
 ```python
 # 1. What does ST report at the failing position?
-r = scope_at_test("/path/to/syntax_test_git_config", 71, 28)
+r = scope_at_test("/work/syntax_test_git_config", 71, 28)
 print(r["scope"], "via", r["resolved_syntax"])
 
 # 2. Did both engines sample the same point? (past-EOL divergence is common)
 r = resolve_position(
-    "/path/to/syntax_test_git_config", 71, 29,
+    "/work/syntax_test_git_config", 71, 29,
     syntax_path="Packages/Git Formats/Git Config.sublime-syntax",
 )
 print("overflow:", r["overflow"], "clamped:", r["clamped"], "actual:", r["actual"])
 
 # 3. Does ST's own runner agree?
-r = run_syntax_tests("/path/to/syntax_test_git_config")
+r = run_syntax_tests("/work/syntax_test_git_config")
 print(r["summary"])
 ```
 
@@ -192,7 +199,7 @@ v.set_scratch(True); v.close()
 A `view.scope_name(point)` call on an already-tokenised view costs around 150 µs (measured: 5 × 500-sample medians on a 1.2k-line Python source view, ST 4200 stable). It's also thread-safe and runs concurrent with ST's UI, so a several-hundred-row sweep in one `exec_sublime_python` call comfortably fits the 60 s per-call budget — three orders of magnitude of headroom. The cold-view cost is a one-time tokenisation pass on the first helper call against a given path.
 
 ```python
-scopes = [scope_at("/path/to/big_file", row, 0)["scope"] for row in range(3020, 3039)]
+scopes = [scope_at("/work/big_file", row, 0)["scope"] for row in range(3020, 3039)]
 _ = scopes  # returns via `result`
 ```
 
@@ -223,7 +230,7 @@ When that happens, enumerate failing positions externally and probe each one:
 ```python
 # failing_positions = [(row, col), ...] — produced separately, e.g. by
 # syntect's examples/syntest harness against the same file.
-results = [scope_at_test("/abs/path/to/syntax_test_huge", r, c) for r, c in failing_positions]
+results = [scope_at_test("/work/syntax_test_huge", r, c) for r, c in failing_positions]
 _ = results
 ```
 

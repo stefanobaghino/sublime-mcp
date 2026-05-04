@@ -4,108 +4,108 @@ This file is loaded only when `SKILL.md`'s preflight check (§1) fails. The top-
 
 ## What has to be true
 
-- Sublime Text is running with `sublime_mcp.py` loaded. The ST console (**View → Show Console**) shows `[sublime-mcp] listening on 127.0.0.1:47823`.
-- Claude Code has the server registered under the name `sublime-text`:
+- **Docker is installed and the daemon is running.** `docker info` exits 0.
+- **The harness is on `PATH`.** `sublime-mcp --help` works.
+- **Claude Code has the server registered under the name `sublime-text`.**
   ```bash
   claude mcp list | grep sublime-text
   ```
   Expected: `sublime-text ✓ Connected`.
 
-## One-command smoke check
+When a Claude Code session is using the skill, `docker ps --filter label=sublime-mcp-harness` shows one running container. The harness owns the container; closing the session reclaims it.
+
+## Install the harness
+
+The harness is shipped as a single Python module + a Dockerfile, distributed via the source repo. v1 is editable-install only; the runtime needs the bundled assets to live next to the module.
 
 ```bash
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"exec_sublime_python",
-                 "arguments":{"code":"print(sublime.version())"}}}'
+git clone https://github.com/stefanobaghino/sublime-mcp.git
+cd sublime-mcp
+pipx install -e .
 ```
 
-Returns ST's build number in `output` on a healthy setup. Connection refused → ST isn't running the plugin. 404 → wrong endpoint path (should be `/mcp`).
+`pipx install -e` keeps `sublime-mcp` pointing at this checkout — pulling new commits picks them up; switching branches switches the harness code. Plain `pip install -e .` works too if you already have a managed environment.
 
-## If the plugin isn't loaded
-
-Re-run the symlink from [`README.md#install`](../../README.md#install) and reopen ST (or save any `.py` file under `Packages/User/`) to trigger `plugin_loaded()`. The ST console should show the listening line.
-
-## If Sublime Text has no open window
-
-ST's plugin host can run while no editor window is open (the app stays alive in the background, especially on macOS). Helpers that drive views (`open_view`, `scope_at`, `scope_at_test`, `resolve_position`) raise `RuntimeError: open_view: Sublime Text has no open window` in this state. Open one:
+## Register with Claude Code
 
 ```bash
-# macOS
-open -a "Sublime Text"
-
-# Linux: launch from your desktop entry, or invoke the binary directly
-# (often `sublime_text` or `subl` if you've set up a symlink on PATH).
-# Windows: launch via the Start menu / taskbar shortcut. There is no
-# universal CLI helper.
+claude mcp add --scope user --transport stdio sublime-text -- \
+    sublime-mcp --mount "$PWD:/work"
 ```
 
-To reproduce headlessness deliberately and verify the guard end-to-end (macOS recipe — Linux/Windows have no equivalent for AppleScript-driven window control, so verify there by quitting all windows manually instead). The scenario is also automated as `tests/headless_smoke.py`, which drives ST through MCP rather than AppleScript and so works on any platform; CI runs it on macOS via `.github/workflows/headless.yml`.
+The name `sublime-text` is load-bearing: the skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
+
+`--mount $PWD:/work` makes the current working tree visible to ST inside the container. Repeat the flag for additional directories. **Without a `--mount`, every path you'd pass in `exec_sublime_python` calls is invisible to ST** — the skill recipes assume this mount.
+
+The first agent connection triggers `docker build`; expect a few minutes the first time. Subsequent connections boot the container in a few seconds.
+
+## Smoke check
+
+After registering, in a Claude Code session that has the skill loaded:
+
+```
+mcp__sublime-text__exec_sublime_python({ code: "print(sublime.version())" })
+```
+
+Returns ST's build number in `output` on a healthy setup. If the call errors with `FileNotFoundError` for a path under `/work`, the user forgot the `--mount`; re-register with one.
+
+## Troubleshooting
+
+### Harness fails to start
+
+The harness writes diagnostics on stderr prefixed with `[sublime-mcp-harness]`. Common cases:
+
+- `ERROR: docker not found on PATH` — install Docker (Docker Desktop on macOS/Windows, `docker-ce` package on Linux), start the daemon, retry.
+- `ERROR: docker build failed` — re-run `sublime-mcp --rebuild --mount …` to see the build output. Most often: transient apt-mirror failure; retry. If persistent, the apt repo for Sublime Text may have shifted; file an issue.
+- `ERROR: Sublime Text never opened a window (last state: …)` — the container booted but ST didn't reach a windowed state inside the readiness budget. Check `docker logs <container_id>` for Xvfb errors or licensing dialogs blocking startup.
+
+### `docker ps` shows the container but tool calls hang
+
+The plugin host inside the container is wedged. Restart the agent session (closing it triggers `docker stop`); a fresh one will spawn a new container.
+
+### Multi-agent: ports / containers
+
+Each agent session spawns its own harness, which spawns its own container. Host ports are kernel-assigned (`-p 127.0.0.1:0:47823`), so concurrent agents don't collide. `docker ps --filter label=sublime-mcp-harness` lists them — the label value is the harness's PID, useful for matching a container to a specific session.
+
+Each ST instance uses ~100–300 MB RAM. If you routinely run many concurrent agents, watch overall memory pressure.
+
+### Sublime Text license
+
+ST runs in evaluation mode by default inside the container. The plugin is unaffected; under Xvfb the nag dialog is invisible. To suppress evaluation state, pass a license:
 
 ```bash
-# Step 1. Save or discard any unsaved work — the close call below is a
-# polite per-window quit and will block on the unsaved-buffer dialog.
-# Do NOT pass `saving no` (destructive, risks data loss).
-osascript -e 'tell app "Sublime Text" to close every window'
-osascript -e 'tell app "Sublime Text" to count of windows'   # → 0
-
-# Step 2. Confirm the plugin host still sees zero windows.
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"print(len(sublime.windows()))"}}}'
-# Expected: response `output` contains "0\n".
-
-# Step 3. Trigger the guard. Any path works — the guard fires before
-# the file is read.
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"open_view(\"/tmp/anything\")"}}}'
-# Expected: response `error` contains "no open window" and "install.md".
-
-# Step 4. Recover by opening any window, then retry the original call.
-open -a "Sublime Text"
+sublime-mcp --mount "$PWD:/work" --license-file ~/path/to/License.sublime_license
 ```
+
+The file is mounted read-only into the container's `~/.config/sublime-text/Local/`.
 
 ## Verifying symlinked-package URI resolution
 
-`_to_resource_path` reverse-maps a path under a symlinked entry of `sublime.packages_path()` (e.g. `testdata/Packages/Markdown` symlinked as `~/Library/.../Packages/Markdown`) to a `Packages/<symlink_name>/...` URI that ST's resource indexer agrees on. To verify end-to-end against your real ST install:
+`_to_resource_path` reverse-maps a path under a symlinked entry of `sublime.packages_path()` to a `Packages/<symlink_name>/...` URI that ST's resource indexer agrees on. Inside the container, `sublime.packages_path()` is `/root/.config/sublime-text/Packages`. To verify end-to-end via the harness:
 
-> **Warning:** this recipe creates a symlink in your real ST Packages directory. Step 3 removes it. If you skip cleanup, ST's resource indexer keeps treating the target as a registered package across sessions until you manually `unlink` it. The recipe uses a deliberately unique symlink name (`__sublime_mcp_verify__`) so it cannot collide with any real package or shadow ST's bundled syntax handling.
-
-macOS paths shown — adjust for Linux's `~/.config/sublime-text/Packages/` or your platform's equivalent.
-
-```bash
-# Step 1. Pre-check (recovers from a prior interrupted run; -L matches
-# only symlinks, so it cannot clobber a real package), then create.
-[ -L ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__ ] && \
-  unlink ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
-ln -s /path/to/your/Packages/Markdown \
-      ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
-
-# Step 2. Call run_syntax_tests with the *target path* (outside the
-# Packages tree); the symlink-walk reverse-maps it to
-# Packages/__sublime_mcp_verify__/...
-curl -s -X POST http://127.0.0.1:47823/mcp \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"r = run_syntax_tests(\"/path/to/your/Packages/Markdown/tests/syntax_test_markdown.md\"); print(r[\"summary\"])"}}}'
-# Success: `summary` is a numeric "N assertions passed" or
-# "FAILED: M of N assertions failed". Explicitly NOT a top-level
-# `error` carrying "is not under sublime.packages_path()" (the
-# symlink-walk failed to reverse-map) or "Sublime Text has not
-# indexed the resource" (mapped, but ST's resource indexer disagreed
-# with the reconstructed URI).
-
-# Step 3. Cleanup (do not skip). unlink, NOT rm -r / rm -rf — those
-# follow the symlink and would delete the target's contents.
-unlink ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
+```python
+# Inside an exec_sublime_python call:
+import os
+target = "/work/testdata/Packages/Markdown"   # mounted by the user
+link = os.path.join(sublime.packages_path(), "__sublime_mcp_verify__")
+if os.path.lexists(link):
+    os.unlink(link)
+os.symlink(target, link)
+try:
+    r = run_syntax_tests("/work/testdata/Packages/Markdown/tests/syntax_test_markdown.md")
+    print(r["summary"])
+finally:
+    os.unlink(link)
 ```
+
+Success: `summary` is a numeric "N assertions passed" or "FAILED: M of N assertions failed". A top-level `error` carrying "is not under sublime.packages_path()" means the symlink-walk failed to reverse-map.
 
 ## If Claude Code can't see the server
 
 ```bash
-claude mcp add --transport http --scope user \
-  sublime-text http://127.0.0.1:47823/mcp
+claude mcp remove sublime-text
+claude mcp add --scope user --transport stdio sublime-text -- \
+    sublime-mcp --mount "$PWD:/work"
 ```
 
 The name `sublime-text` is load-bearing: this skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
@@ -115,5 +115,6 @@ The name `sublime-text` is load-bearing: this skill's `allowed-tools` hard-codes
 Open an issue at <https://github.com/stefanobaghino/sublime-mcp/issues> with:
 
 - `claude mcp list` output
-- The curl probe's response (stdout + stderr)
-- ST console contents from the `[sublime-mcp]` line onwards
+- `docker ps --filter label=sublime-mcp-harness` output
+- `docker logs <cid>` for the failing container (if any)
+- The harness's stderr (the `[sublime-mcp-harness]` lines)
