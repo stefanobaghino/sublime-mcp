@@ -115,6 +115,17 @@ them in `run_on_main(...)`. The following names are preloaded:
   re-raises whatever it raised). Use it for buffer-mutating
   `TextCommand` calls (`view.run_command("append", ...)` and friends)
   which silently no-op when invoked from the worker thread.
+- `temp_packages_link(filesystem_path) -> str` /
+  `release_packages_link(name) -> None` — synthesise (and tear down)
+  a managed `Packages/__sublime_mcp_temp_<nonce>__` symlink whose
+  target is `filesystem_path`'s parent (or the path itself if a
+  directory). Returns the synthesised package name; build URIs as
+  `Packages/<name>/<basename>` to feed `assign_syntax_and_wait` /
+  `resolve_position`. Replaces the manual `ln -s ...` recipe for
+  repo-local syntaxes (e.g. `testdata/Packages/...` from another
+  parser's repo). For cross-grammar investigations needing the
+  whole testdata tree (cross-includes resolve to built-ins under
+  this per-syntax mode), see SKILL.md §6 follow-up.
 
 ## text_point overflow
 
@@ -217,6 +228,21 @@ r = run_inline_syntax_test(
     "syntax_test_probe",
 )
 print(r["state"], r["summary"])
+```
+
+### Probe a repo-local syntax
+
+```python
+name = temp_packages_link("/abs/path/to/repo/testdata/Packages/Java/Java.sublime-syntax")
+try:
+    r = resolve_position(
+        "/abs/path/to/syntax_test_input", row=0, col=0,
+        syntax_path="Packages/%s/Java.sublime-syntax" % name,
+    )
+    assert r["resolved_syntax"] == r["requested_syntax"], r
+    print(r["scope"])
+finally:
+    release_packages_link(name)
 ```
 
 ### Compare a syntect baseline failure against ST
@@ -678,6 +704,94 @@ def _new_temp_dir():
     full = _os.path.join(sublime.packages_path(), "User", name)
     _os.makedirs(full)
     return name, full
+
+
+def _sweep_stale_temp_packages():
+    # Sister to _sweep_stale_temp_dirs but for symlinks under
+    # Packages/ (not Packages/User/). Uses lstat so the mtime is the
+    # symlink's, not the target's; a stale symlink whose target was
+    # rewritten yesterday should still be eligible for sweep.
+    packages_root = sublime.packages_path()
+    try:
+        entries = _os.listdir(packages_root)
+    except OSError:
+        return
+    now = _time.time()
+    for name in entries:
+        if not (name.startswith(_TEMP_DIR_PREFIX) and name.endswith(_TEMP_DIR_SUFFIX)):
+            continue
+        full = _os.path.join(packages_root, name)
+        if not _os.path.islink(full):
+            continue
+        try:
+            age = now - _os.lstat(full).st_mtime
+        except OSError:
+            continue
+        if age < _TEMP_DIR_MAX_AGE_SECONDS:
+            continue
+        try:
+            _os.unlink(full)
+        except OSError:
+            pass
+
+
+def temp_packages_link(filesystem_path):
+    # Synthesise a Packages/__sublime_mcp_temp_<nonce>__ symlink whose
+    # target is the parent dir of `filesystem_path` (or the path itself
+    # if it's a directory). Wait for ST's resource indexer to surface
+    # the sentinel resource. Returns the synthesised package name —
+    # callers build "Packages/<name>/<basename>" URIs against the
+    # existing helpers (assign_syntax_and_wait, resolve_position) and
+    # call release_packages_link(name) when done. Two-layer cleanup
+    # (mirrors run_inline_syntax_test): caller-managed within-call,
+    # _sweep_stale_temp_packages at the head for SIGKILL paths.
+    import uuid as _uuid
+    abs_path = _os.path.abspath(filesystem_path)
+    if _os.path.isdir(abs_path):
+        target_dir = abs_path
+        sentinel_basename = None
+    else:
+        target_dir = _os.path.dirname(abs_path)
+        sentinel_basename = _os.path.basename(abs_path)
+    if not _os.path.isdir(target_dir):
+        raise RuntimeError(
+            "temp_packages_link: target dir %r does not exist" % target_dir
+        )
+    _sweep_stale_temp_packages()
+    nonce = _uuid.uuid4().hex[:12]
+    name = "%s%s%s" % (_TEMP_DIR_PREFIX, nonce, _TEMP_DIR_SUFFIX)
+    link_path = _os.path.join(sublime.packages_path(), name)
+    _os.symlink(target_dir, link_path)
+    if sentinel_basename is not None:
+        sentinel_resource = "Packages/%s/%s" % (name, sentinel_basename)
+        if not _wait_for_resource(sentinel_resource):
+            try:
+                _os.unlink(link_path)
+            finally:
+                raise RuntimeError(
+                    "temp_packages_link: ST did not index %s within the wait budget"
+                    % sentinel_resource
+                )
+    return name
+
+
+def release_packages_link(name):
+    # Companion teardown for temp_packages_link. Idempotent: a missing
+    # link is not an error (the cross-call sweep may have removed it).
+    # Refuses to touch any name outside the temp prefix/suffix scheme,
+    # so a buggy caller can't accidentally unlink a real package.
+    if not (name.startswith(_TEMP_DIR_PREFIX) and name.endswith(_TEMP_DIR_SUFFIX)):
+        raise ValueError(
+            "release_packages_link: refusing to remove non-temp name %r" % name
+        )
+    link_path = _os.path.join(sublime.packages_path(), name)
+    if not _os.path.lexists(link_path):
+        return
+    if not _os.path.islink(link_path):
+        raise RuntimeError(
+            "release_packages_link: %r is not a symlink; refusing to remove" % link_path
+        )
+    _os.unlink(link_path)
 
 
 def run_inline_syntax_test(content, name):
