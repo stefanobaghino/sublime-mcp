@@ -1382,3 +1382,143 @@ class _FakeWindow:
         v1_calls, v2_calls = json.loads(outcome["output"])
         self.assertEqual(v1_calls, ["Packages/Python/Python.sublime-syntax"])
         self.assertEqual(v2_calls, ["Packages/Python/Python.sublime-syntax"])
+
+
+@unittest.skipIf(
+    sys.platform == "win32",
+    "TestResolvePositionFilesystemSyntax requires symlink creation, "
+    "which needs SeCreateSymbolicLinkPrivilege or Developer Mode on "
+    "Windows. Same constraint as TestToResourcePathSymlinked.",
+)
+class TestResolvePositionFilesystemSyntax(HelperTestBase):
+    """`resolve_position`'s `syntax_path` accepts a filesystem path under
+    `sublime.packages_path()` (directly or via a symlink in that
+    directory) and normalises it to a `Packages/...` URI before
+    calling `assign_syntax_and_wait`. The normalisation is what keeps
+    the #11 silent-fallback contract (`resolved_syntax ==
+    requested_syntax` equality) meaningful when callers pass
+    filesystem paths — the equality itself is not re-asserted here
+    because fresh temp syntaxes race ST's syntax-loader latency; see
+    the per-test comments.
+
+    Reuses `TestTempPackagesLink`'s syntax-fixture pattern: synthesise
+    a `.sublime-syntax` under a tempdir, link it into Packages/ via
+    `temp_packages_link`, then probe.
+    """
+
+    SYNTAX_CONTENT = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: SublimeMcpResolvePositionProbe\n"
+        "scope: source.smrpp\n"
+        "file_extensions: [smrpp]\n"
+        "version: 2\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: 'x'\n"
+        "      scope: keyword.smrpp\n"
+    )
+
+    SYNTAX_BASENAME = "Probe.sublime-syntax"
+
+    def setUp(self):
+        self._defensive_link_sweep()
+        self.target_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_resolve_")
+        self.addCleanup(shutil.rmtree, self.target_dir, ignore_errors=True)
+        self.syntax_path = os.path.join(self.target_dir, self.SYNTAX_BASENAME)
+        with open(self.syntax_path, "w") as f:
+            f.write(self.SYNTAX_CONTENT)
+        # Plain text fixture for resolve_position's `path` arg — the
+        # syntax assignment is what's under test, not the file's
+        # default-syntax inference.
+        self.fixture_path = self._write_fixture("filesystem_syntax", "x = 1\n")
+
+    def _defensive_link_sweep(self):
+        # Same as TestTempPackagesLink — clean stale temp symlinks
+        # left behind by a prior crashed run.
+        packages_root = sublime.packages_path()
+        for name in os.listdir(packages_root):
+            if not (name.startswith("__sublime_mcp_temp_") and name.endswith("__")):
+                continue
+            full = os.path.join(packages_root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+
+    def _release(self, name):
+        link_path = os.path.join(sublime.packages_path(), name)
+        if os.path.lexists(link_path) and os.path.islink(link_path):
+            os.unlink(link_path)
+
+    def test_filesystem_path_normalises_to_packages_uri(self):
+        # The #22 contract is the normalisation: a filesystem-form
+        # syntax_path is rewritten to Packages/<name>/... before being
+        # echoed as `requested_syntax`. That is what this class pins.
+        # Deliberately NOT asserting resolved_syntax: ST's resource
+        # indexer (find_resources, which temp_packages_link waits for)
+        # and its syntax-loader (which view.syntax() reads) have
+        # different latencies for fresh syntaxes — view.syntax() can
+        # still be None when the resource has surfaced, leading to a
+        # racy assertion. The resolved_syntax==requested_syntax
+        # silent-fallback contract from #11 is exercised by
+        # TestResolvePosition.test_in_bounds_no_flags_set against the
+        # bundled Python syntax (no fresh-syntax race).
+        code = (
+            "import json\n"
+            "name = temp_packages_link(%r)\n"
+            "try:\n"
+            "    r = resolve_position(%r, 0, 0, syntax_path=%r)\n"
+            "    print(json.dumps([name, r]))\n"
+            "finally:\n"
+            "    release_packages_link(name)\n"
+        ) % (self.syntax_path, self.fixture_path, self.syntax_path)
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name, r = json.loads(outcome["output"])
+        expected_uri = "Packages/%s/%s" % (name, self.SYNTAX_BASENAME)
+        self.assertEqual(r["requested_syntax"], expected_uri)
+
+    def test_packages_uri_input_still_works(self):
+        # Regression-proofing: the existing `Packages/...` URI form
+        # passes through `_to_resource_path` unchanged. Tests that #22
+        # didn't break the original contract. resolved_syntax is again
+        # not asserted (same fresh-syntax race as the sibling test).
+        code = (
+            "import json\n"
+            "name = temp_packages_link(%r)\n"
+            "try:\n"
+            "    uri = 'Packages/%%s/%s' %% name\n"
+            "    r = resolve_position(%r, 0, 0, syntax_path=uri)\n"
+            "    print(json.dumps([name, r]))\n"
+            "finally:\n"
+            "    release_packages_link(name)\n"
+        ) % (self.syntax_path, self.SYNTAX_BASENAME, self.fixture_path)
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name, r = json.loads(outcome["output"])
+        expected_uri = "Packages/%s/%s" % (name, self.SYNTAX_BASENAME)
+        self.assertEqual(r["requested_syntax"], expected_uri)
+
+    def test_outside_packages_filesystem_path_raises(self):
+        # A filesystem path with no symlink chain into Packages/ must
+        # raise ValueError pointing at temp_packages_link, not silently
+        # pass through to view.assign_syntax (which would fall back to
+        # text.plain — the failure mode #11 hardened against).
+        unreachable = tempfile.mkdtemp(prefix="sublime_mcp_test_unreachable_")
+        self.addCleanup(shutil.rmtree, unreachable, ignore_errors=True)
+        unreachable_syntax = os.path.join(unreachable, self.SYNTAX_BASENAME)
+        with open(unreachable_syntax, "w") as f:
+            f.write(self.SYNTAX_CONTENT)
+        code = (
+            "resolve_position(%r, 0, 0, syntax_path=%r)\n"
+        ) % (self.fixture_path, unreachable_syntax)
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ValueError", outcome["error"])
+        self.assertIn("not under sublime.packages_path()", outcome["error"])
+        self.assertIn("temp_packages_link", outcome["error"])
