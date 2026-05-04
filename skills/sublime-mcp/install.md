@@ -21,10 +21,10 @@ The harness is shipped as a single Python module + a Dockerfile, distributed via
 ```bash
 git clone https://github.com/stefanobaghino/sublime-mcp.git
 cd sublime-mcp
-pipx install -e .
+uv tool install --editable .
 ```
 
-`pipx install -e` keeps `sublime-mcp` pointing at this checkout — pulling new commits picks them up; switching branches switches the harness code. Plain `pip install -e .` works too if you already have a managed environment.
+`uv tool install --editable .` keeps `sublime-mcp` pointing at this checkout — pulling new commits picks them up; switching branches switches the harness code. `pipx install -e .` and plain `pip install -e .` work too if you already have one of those set up.
 
 ## Register with Claude Code
 
