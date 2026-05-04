@@ -1,0 +1,41 @@
+name: headless-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  headless-smoke-macos:
+    runs-on: macOS-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: SublimeText/UnitTesting/actions/setup@v1
+        with:
+          sublime-text-version: 4
+          install-package-control: false
+      - name: Launch Sublime Text in the background
+        run: |
+          # Mirrors `subl --stay &` from UnitTesting's run_tests.py.
+          # Detaches so the workflow step doesn't block.
+          subl --stay &
+          # Wait for the MCP server (ST plugin loaded) to listen.
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null -X POST http://127.0.0.1:47823/mcp \
+                -H 'Content-Type: application/json' \
+                -d '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'; then
+              echo "MCP server up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MCP server did not respond after 60s"
+          exit 1
+        shell: bash
+      - name: Run headless-smoke probe
+        run: python3 tests/headless_smoke.py
+        shell: bash
+      - name: Tear down Sublime Text
+        if: always()
+        run: pkill [Ss]ubl || true
+        shell: bash
