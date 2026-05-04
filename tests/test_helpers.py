@@ -606,34 +606,32 @@ class TestScopeAtTestHtmlComment(HelperTestBase):
 class TestHeadlessGuard(HelperTestBase):
     """`open_view` raises `RuntimeError` when ST has no open window.
 
-    Both clauses of the guard (`active_window() is None` AND
-    `len(sublime.windows()) == 0`) are exercised in CI by patching
-    `sublime` module attributes via `unittest.mock.patch.object`. Each
-    test patches BOTH names, even though only one clause is under test:
-    the other patch forces the non-tested clause's predicate False so a
-    regression in the tested clause cannot be silently rescued by the
-    other (e.g., a CI environment that happens to have no real window).
+    Both clauses of the guard (`_get_active_window() is None` AND
+    `len(_get_windows()) == 0`) are exercised by overriding the seams
+    in the snippet's globals. Each test overrides BOTH names, even
+    though only one clause is under test: the other override forces
+    the non-tested clause's predicate False so a regression in the
+    tested clause cannot be silently rescued by the other (e.g., a CI
+    environment that happens to have no real window).
 
-    Stability invariant: these tests rely on `open_view` reading
-    `sublime.active_window` / `sublime.windows` *through the module at
-    call time* (sublime_mcp.py:268-269). A future refactor that captures
-    references at module import would silently neuter both tests because
-    the patch would land on names the helper no longer reads.
+    Stability invariant: these tests rely on `open_view` reading the
+    seams through their module-global names at call time. A future
+    refactor that captures references at definition time would
+    silently neuter both tests because the override would land on
+    names the helper no longer reads.
 
-    Blast-radius caveat: while a `patch.object` context is active, the
-    override is process-global within the ST plugin host and visible to
-    autosave timers, indexers, concurrent MCP daemon-thread requests,
-    and ST's UI thread. Keep the patch window as narrow as possible —
-    wrap *only* the `open_view` call, not surrounding setUp / fixture
-    writes / assertions. A multi-helper patch under one context is a
-    code smell; split into smaller scoped patches instead.
+    Seam-vs-`patch.object(sublime, ...)` rationale: overriding the
+    seam in the snippet's globals scopes the mock to this snippet's
+    namespace. Compared to the prior `patch.object(sublime, 'windows',
+    ...)` shape, ST's autosave timers, indexers, and concurrent MCP
+    requests — which read `sublime.windows` directly — are unaffected
+    for the duration of the test.
     """
 
     GUARD_SNIPPET = (
-        "import unittest.mock\n"
-        "with unittest.mock.patch.object(sublime, 'windows', new={windows_mock}), \\\n"
-        "     unittest.mock.patch.object(sublime, 'active_window', new={aw_mock}):\n"
-        "    open_view('/tmp/sublime_mcp_headless_test')\n"
+        "_get_windows = {windows_mock}\n"
+        "_get_active_window = {aw_mock}\n"
+        "open_view('/tmp/sublime_mcp_headless_test')\n"
     )
 
     def test_open_view_raises_on_zero_windows(self):
@@ -681,12 +679,14 @@ class TestToResourcePathSymlinked(HelperTestBase):
     a symlink in `sublime.packages_path()`, returning a `Packages/
     <symlink_name>/...` URI rather than `None`.
 
-    Blast-radius caveat: setUp creates a symlink under a deliberately
+    Real-filesystem caveat: setUp creates a symlink under a deliberately
     unique name (`__sublime_mcp_test_symlink__`) inside the user's real
     `sublime.packages_path()`. While the symlink is in place, ST's
-    resource indexer treats it as a registered package — same kind of
-    host-wide mutation as `TestHeadlessGuard`'s `patch.object`, just via
-    filesystem rather than module-attribute mutation.
+    resource indexer treats it as a registered package. The hermetic
+    peer `TestToResourcePathSeam` exercises the same symlink-walk
+    branches without touching the filesystem; this class is the
+    integration test that pins the contract against a real
+    `os.symlink` on the user's `Packages/`.
 
     Cleanup discipline: the symlink is registered with `addCleanup`
     (not `tearDown`) immediately after `os.symlink` so it fires even if
@@ -761,6 +761,81 @@ class TestToResourcePathSymlinked(HelperTestBase):
             f.write("x\n")
         code = "print(_to_resource_path(%r))" % unrelated_input
         resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "None")
+
+
+@unittest.skipIf(
+    sys.platform == "win32",
+    "TestToResourcePathSeam needs `os.symlink` to construct a real "
+    "symlink for `_to_resource_path` to walk via realpath. The seam "
+    "removes the listdir against the user's Packages/ but the islink "
+    "and realpath checks still need a real symlink on disk.",
+)
+class TestToResourcePathSeam(HelperTestBase):
+    """Hermetic peer of `TestToResourcePathSymlinked`. Exercises the
+    realpath-target reverse-walk inside `_to_resource_path` without
+    creating a symlink under the user's `sublime.packages_path()`.
+
+    The `_list_packages_entries` seam bounds the directory enumeration
+    so the test injects synthetic entries via the snippet's globals.
+    The per-entry `os.path.islink` / `realpath` checks happen against
+    real filesystem objects under a tempdir — the seam doesn't replace
+    those, by design (keeping the symlink-walk logic in
+    `_to_resource_path` rather than diluting the seam into multiple
+    indirections).
+    """
+
+    def setUp(self):
+        # Build a sandbox containing a real symlink whose target is a
+        # tempdir with `foo.md`. The seam will return this as the only
+        # entry; _to_resource_path's loop will islink it, realpath the
+        # target, and reverse-map.
+        self.sandbox = tempfile.mkdtemp(prefix="sublime_mcp_seam_sandbox_")
+        self.addCleanup(shutil.rmtree, self.sandbox, ignore_errors=True)
+        self.target_dir = tempfile.mkdtemp(prefix="sublime_mcp_seam_target_")
+        self.addCleanup(shutil.rmtree, self.target_dir, ignore_errors=True)
+        with open(os.path.join(self.target_dir, "foo.md"), "w") as f:
+            f.write("# heading\n")
+        self.fake_link_name = "fake_pkg"
+        self.fake_link_path = os.path.join(self.sandbox, self.fake_link_name)
+        os.symlink(self.target_dir, self.fake_link_path)
+
+    def _seam_override_snippet(self, probe_path):
+        # Override `_list_packages_entries` in the snippet's globals to
+        # return our synthetic single-entry list, then call
+        # `_to_resource_path` and print its return value.
+        return (
+            "_list_packages_entries = lambda root: [(%r, %r)]\n"
+            "print(_to_resource_path(%r))\n"
+        ) % (self.fake_link_name, self.fake_link_path, probe_path)
+
+    def test_target_path_reverse_maps_via_seam(self):
+        # Realpath-target case: the input path is under the symlink
+        # target, not the symlink name. The seam returns one entry; the
+        # walk islinks it, realpath-matches, and reverse-maps to
+        # Packages/fake_pkg/foo.md.
+        target_input = os.path.join(self.target_dir, "foo.md")
+        resp = yield from _call_tool_yielding(
+            self._seam_override_snippet(target_input)
+        )
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "Packages/fake_pkg/foo.md")
+
+    def test_outside_seam_entries_returns_none(self):
+        # Negative case: the input is unrelated to any seam entry.
+        # The walk islinks the only entry, realpath doesn't match, the
+        # function falls through to return None.
+        unrelated = tempfile.mkdtemp(prefix="sublime_mcp_seam_unrelated_")
+        self.addCleanup(shutil.rmtree, unrelated, ignore_errors=True)
+        unrelated_input = os.path.join(unrelated, "foo.md")
+        with open(unrelated_input, "w") as f:
+            f.write("x\n")
+        resp = yield from _call_tool_yielding(
+            self._seam_override_snippet(unrelated_input)
+        )
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "None")
