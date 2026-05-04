@@ -57,7 +57,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 - Assign to `_` inside the snippet to get its `repr` back as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
 - `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
-- `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`).
+- `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
@@ -100,10 +100,12 @@ for msg in r["failures"]:
 
 Branch on `state` for the assertion-run outcome:
 
-| `state`     | meaning                                                                          | `summary` shape                                  | `failures`     |
-| ----------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | -------------- |
-| `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
-| `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
+| `state`     | meaning                                                                          | `summary` shape                                  | `failures` / `failures_structured` |
+| ----------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------- |
+| `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]` / `[]`                        |
+| `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated                          |
+
+`failures_structured[i]` is the parsed peer of `failures[i]` — `{file, row, col, error_label, expected_selector, actual: [{col_range, scope_chain}, ...]}`. The parser is best-effort: on an unexpected line shape any field can be `None` / empty and `failures[i]` remains the canonical record.
 
 When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. The reachable causes are: resource not yet indexed, path outside `sublime.packages_path()` (symlink it in first — see "Confirm which syntax ST assigned (and handle repo-local syntaxes)" below), and the private `sublime_api.run_syntax_test` missing on this ST build. For ground-truth questions that don't need the assertion runner, fall back to `scope_at` / `scope_at_test` or `resolve_position`.
 
@@ -251,7 +253,7 @@ _Last synced with issue state: 2026-05-04._
 - `scope_at(path, row, col) -> dict` — open file, return `{"scope", "resolved_syntax"}`. `resolved_syntax` is `view.syntax().path` (or `None`); compare against the canonical plain-text URI to detect extension-less / no-syntax fallback.
 - `scope_at_test(path, row, col) -> dict` — parse `# SYNTAX TEST` header, assign that syntax, return `{"scope", "requested_syntax", "resolved_syntax"}`. `requested_syntax != resolved_syntax` flags silent fallback to the wrong syntax.
 - `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags; also carries `requested_syntax` / `resolved_syntax`.
-- `run_syntax_tests(path) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`. Path must resolve under `sublime.packages_path()` (directly or via a symlink in that directory); paths outside the Packages tree raise.
+- `run_syntax_tests(path) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures, failures_structured}`. Path must resolve under `sublime.packages_path()` (directly or via a symlink in that directory); paths outside the Packages tree raise.
 - `run_inline_syntax_test(content, name) -> dict` — synthetic-probe variant: writes `content` to a managed temp dir under `Packages/User/`, runs the runner, cleans up. Same shape as `run_syntax_tests` plus a `"inconclusive"` state when ST never indexes the temp resource.
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
