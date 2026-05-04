@@ -1268,3 +1268,117 @@ class TestTempPackagesLink(HelperTestBase):
         name = outcome["output"].strip()
         self.addCleanup(self._release, name)
         self.assertFalse(os.path.lexists(stale_link))
+
+
+class TestFindResources(HelperTestBase):
+    """`find_resources` is a thin wrap of `sublime.find_resources`. A
+    smoke test against a known bundled resource is sufficient — the
+    helper has no logic of its own beyond `list(...)`-ing the result.
+    """
+
+    def test_finds_bundled_python_syntax(self):
+        code = (
+            "results = find_resources('Python.sublime-syntax')\n"
+            "print('Packages/Python/Python.sublime-syntax' in results)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "True")
+
+    def test_returns_list(self):
+        # Wrapper materialises the result via list(). Asserts the type
+        # contract — locks down a regression where the wrapper is
+        # accidentally turned into a generator passthrough.
+        code = (
+            "results = find_resources('Python.sublime-syntax')\n"
+            "print(type(results).__name__)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "list")
+
+
+class TestReloadSyntax(HelperTestBase):
+    """`reload_syntax` re-binds the resource path on every view whose
+    `settings()["syntax"]` matches; views bound to other syntaxes are
+    untouched. ST's downstream behaviour (re-tokenising, rescanning the
+    resource) is a side effect of the re-bind, not part of the helper's
+    contract.
+
+    Hermetic: relies on the `_get_windows` seam (#20) to inject a fake
+    windows-and-views graph in the snippet's globals. No real ST views
+    are created; no real syntax assignment happens. The test pins the
+    helper's observable effect (`view.assign_syntax(uri)` calls) without
+    depending on ST's reload pipeline.
+    """
+
+    FAKE_GRAPH_PROLOGUE = '''
+class _FakeView:
+    def __init__(self, syntax_uri):
+        self._syntax = syntax_uri
+        self.assign_calls = []
+    def settings(self):
+        return self
+    def get(self, key, default=None):
+        return self._syntax if key == "syntax" else default
+    def assign_syntax(self, uri):
+        self.assign_calls.append(uri)
+
+class _FakeWindow:
+    def __init__(self, views):
+        self._views = views
+    def views(self):
+        return list(self._views)
+'''
+
+    def test_rebinds_matching_view_only(self):
+        code = self.FAKE_GRAPH_PROLOGUE + (
+            "v_py = _FakeView('Packages/Python/Python.sublime-syntax')\n"
+            "v_md = _FakeView('Packages/Markdown/Markdown.sublime-syntax')\n"
+            "_get_windows = lambda: [_FakeWindow([v_py, v_md])]\n"
+            "reload_syntax('Packages/Python/Python.sublime-syntax')\n"
+            "import json\n"
+            "print(json.dumps([v_py.assign_calls, v_md.assign_calls]))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        py_calls, md_calls = json.loads(outcome["output"])
+        self.assertEqual(py_calls, ["Packages/Python/Python.sublime-syntax"])
+        self.assertEqual(md_calls, [])
+
+    def test_no_views_match_no_calls(self):
+        # Negative case: no view's syntax matches → no view sees an
+        # assign_syntax call. Locks the contract that reload_syntax
+        # is a pure observation when there's nothing to re-bind.
+        code = self.FAKE_GRAPH_PROLOGUE + (
+            "v_md = _FakeView('Packages/Markdown/Markdown.sublime-syntax')\n"
+            "_get_windows = lambda: [_FakeWindow([v_md])]\n"
+            "reload_syntax('Packages/Python/Python.sublime-syntax')\n"
+            "import json\n"
+            "print(json.dumps(v_md.assign_calls))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(json.loads(outcome["output"]), [])
+
+    def test_iterates_all_windows(self):
+        # Multiple windows; matching views in each. Locks the iteration
+        # over both `_get_windows()` and `window.views()`.
+        code = self.FAKE_GRAPH_PROLOGUE + (
+            "v1 = _FakeView('Packages/Python/Python.sublime-syntax')\n"
+            "v2 = _FakeView('Packages/Python/Python.sublime-syntax')\n"
+            "_get_windows = lambda: [_FakeWindow([v1]), _FakeWindow([v2])]\n"
+            "reload_syntax('Packages/Python/Python.sublime-syntax')\n"
+            "import json\n"
+            "print(json.dumps([v1.assign_calls, v2.assign_calls]))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        v1_calls, v2_calls = json.loads(outcome["output"])
+        self.assertEqual(v1_calls, ["Packages/Python/Python.sublime-syntax"])
+        self.assertEqual(v2_calls, ["Packages/Python/Python.sublime-syntax"])

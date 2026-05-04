@@ -564,7 +564,12 @@ def resolve_position(path, row, col, syntax_path=None):
 
 
 def reload_syntax(resource_path):
-    # Touch the resource via sublime_plugin to force ST to re-read it.
+    # Contract: re-binds `resource_path` on every view whose
+    # settings()["syntax"] currently equals it; views bound to other
+    # syntaxes are untouched. ST's downstream behaviour (re-tokenising,
+    # rescanning the resource, etc.) is the side effect of the
+    # re-bind, not part of the helper's contract — callers verifying
+    # ST's reload pipeline should observe ST's behaviour separately.
     # sublime_plugin.reload_plugin is for .py plugins; for .sublime-syntax
     # we leverage the fact that ST reloads a syntax when a view using it
     # is reactivated after the resource changes. The pragmatic workaround
