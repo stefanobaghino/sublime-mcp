@@ -9,6 +9,7 @@ Security: binds 127.0.0.1 only; exec'ing arbitrary Python is equivalent to
 an open console. Do not expose the port beyond localhost.
 """
 
+import ast
 import builtins as _builtins
 import io
 import json
@@ -163,8 +164,13 @@ regardless of row wrapping.
 
 ## Output protocol
 
-Anything you `print(...)` is captured and returned as `output`. If you
-assign a value to `_`, its `repr` is returned as `result`. Exceptions
+Anything you `print(...)` is captured and returned as `output`. If your
+snippet ends with a bare expression it is auto-lifted into `_` and
+`repr(_)` is returned as `result`; explicit `_ = ...` at the snippet's
+top level wins (any nested assignment, including inside `if`, `for`, a
+function body, etc., leaves the lift enabled). On a `SyntaxError` the
+snippet is compiled directly so the traceback shape callers see is
+unchanged. Exceptions
 are caught, formatted, and returned as `error` (with whatever was
 printed up to that point still in `output`). Only `print(...)` is
 captured — direct writes to `sys.stderr` / `sys.stdout` are not,
@@ -998,6 +1004,38 @@ def run_syntax_tests(path):
 _HELPERS_CODE = compile(HELPERS_SOURCE, "<sublime-mcp-helpers>", "exec")
 
 
+def _compile_snippet(code):
+    # REPL-style auto-lift: if the snippet ends in a bare expression and
+    # does not assign to `_` at module level, rewrite the trailing Expr
+    # into `_ = <expr>` so callers don't have to remember the idiom.
+    # Strict scope on the explicit-assign check (top-level `tree.body`
+    # only) — `for _ in ...`, `_ = 1` inside `if False:`, or a nested-
+    # function assign all leave the lift enabled.
+    # SyntaxError falls through to the original compile so the
+    # traceback shape callers see is unchanged.
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError:
+        return compile(code, "<sublime-mcp-snippet>", "exec")
+    if not tree.body or not isinstance(tree.body[-1], ast.Expr):
+        return compile(tree, "<sublime-mcp-snippet>", "exec")
+    has_explicit_underscore = any(
+        isinstance(stmt, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_" for t in stmt.targets)
+        for stmt in tree.body
+    )
+    if has_explicit_underscore:
+        return compile(tree, "<sublime-mcp-snippet>", "exec")
+    last = tree.body[-1]
+    tree.body[-1] = ast.Assign(
+        targets=[ast.Name(id="_", ctx=ast.Store())],
+        value=last.value,
+    )
+    ast.copy_location(tree.body[-1], last)
+    ast.fix_missing_locations(tree)
+    return compile(tree, "<sublime-mcp-snippet>", "exec")
+
+
 def _exec_on_worker(code):
     """Run `code` on a dedicated daemon thread and collect output.
 
@@ -1043,7 +1081,8 @@ def _exec_on_worker(code):
             done.set()
             return
         try:
-            exec(compile(code, "<sublime-mcp-snippet>", "exec"), namespace)
+            compiled = _compile_snippet(code)
+            exec(compiled, namespace)
             if "_" in namespace and namespace["_"] is not None:
                 try:
                     result["result"] = repr(namespace["_"])

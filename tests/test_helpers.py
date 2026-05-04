@@ -820,6 +820,54 @@ class TestRunOnMain(HelperTestBase):
         self.assertEqual(outcome["output"].strip(), "5")
 
 
+class TestUnderscoreAutoLift(HelperTestBase):
+    """REPL-style auto-lift in `_compile_snippet`: a trailing bare
+    expression becomes `_ = <expr>` so callers don't need the explicit
+    idiom. Strict scope on the explicit-assign check (top-level only).
+    """
+
+    def test_trailing_expr_lifted_to_underscore(self):
+        resp = yield from _call_tool_yielding("42\n")
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "42")
+
+    def test_explicit_top_level_underscore_blocks_lift(self):
+        # Explicit `_ = 1` at top level wins; the trailing `2` is not lifted.
+        resp = yield from _call_tool_yielding("_ = 1\n2\n")
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "1")
+
+    def test_for_target_named_underscore_does_not_block_lift(self):
+        # `for _ in ...` is ast.For, not ast.Assign; lift should still fire.
+        resp = yield from _call_tool_yielding("for _ in range(3): pass\n42\n")
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "42")
+
+    def test_nested_underscore_assign_does_not_block_lift(self):
+        # `_ = 1` inside `if False:` is not at top level — strict check skips it.
+        code = "if False:\n    _ = 1\n42\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "42")
+
+    def test_trailing_statement_does_not_lift(self):
+        # `x = 1` is ast.Assign, not ast.Expr — nothing to lift.
+        resp = yield from _call_tool_yielding("x = 1\n")
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertIsNone(outcome["result"])
+
+    def test_syntax_error_falls_through(self):
+        resp = yield from _call_tool_yielding("def\n")
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("SyntaxError", outcome["error"])
+
+
 class TestWaitForResource(HelperTestBase):
     """`_wait_for_resource` widened from 1.0 s to 3.0 s and gained a
     one-shot `refresh_folder_list` nudge past two-thirds of the budget
