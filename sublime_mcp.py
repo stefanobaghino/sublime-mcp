@@ -335,6 +335,28 @@ v.close()
   ST removes it, `run_syntax_tests` raises rather than silently
   degrading.
 
+## Commonly misremembered ST API names
+
+A few names that look right but aren't — worth double-checking via
+`dir(sublime)` / `dir(view)` from a snippet before relying on them:
+
+- `sublime.syntax_from_path(resource_path)` — direct lookup by
+  `Packages/...` URI; returns `Syntax | None`. There is no
+  `find_syntax_by_path`.
+- `sublime.find_syntax_for_file(path, first_line=None)` —
+  content-aware resolution (extension + first-line match). Distinct
+  from `syntax_from_path`, which is a direct URI lookup.
+- `view.scope_name(point)` — returns the scope chain at a point. The
+  helper `scope_at(...)` in this tool wraps it; there is no
+  `view.scope_at`.
+- `view.syntax()` returns `Syntax | None` — the honest signal.
+  `view.settings().get("syntax")` echoes whatever string was passed
+  to `assign_syntax`, including bogus URIs, and cannot detect silent
+  fallback.
+- `sublime.load_resource(path)` raises `FileNotFoundError` on stale
+  index entries surfaced by `find_resources`; see SKILL.md §4 for the
+  try-load-and-skip filter.
+
 ## Companion skill
 
 A Claude Code skill with workflow recipes for this tool is bundled at
