@@ -197,6 +197,18 @@ class TestResponseShape(HelperTestBase):
         self.assertIn("RuntimeError: boom", outcome["error"])
         self.assertTrue(resp["result"]["isError"])
 
+    def test_envelope_carries_st_version_and_channel(self):
+        # Envelope-level echo so non-helper snippets (and helper failures
+        # that don't reach the helper return path) still surface which ST
+        # is answering. One assertion covers every helper because the
+        # field lives at the envelope, not on each helper dict.
+        resp = yield from _call_tool_yielding("print('hi')")
+        outcome = _outcome(resp)
+        self.assertIsInstance(outcome["st_version"], int)
+        self.assertEqual(outcome["st_version"], int(sublime.version()))
+        self.assertIsInstance(outcome["st_channel"], str)
+        self.assertTrue(outcome["st_channel"])
+
 
 class TestScopeAtExtensionless(HelperTestBase):
     """The landmine the feedback flagged: `scope_at` on extension-less files

@@ -51,11 +51,12 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 `mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside ST's plugin host (Python 3.8) and returns:
 
 ```json
-{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "isError": false }
+{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "isError": false }
 ```
 
 - Assign to `_` inside the snippet to get its `repr` back as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
+- `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 

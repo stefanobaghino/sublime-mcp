@@ -142,13 +142,22 @@ global stream redirect (needed for thread-safety under concurrent
 requests). The response shape is:
 
 ```
-{"output": str, "result": str|null, "error": str|null}
+{
+  "output": str,
+  "result": str|null,
+  "error": str|null,
+  "st_version": int,
+  "st_channel": str
+}
 ```
 
 `error is null` means the snippet ran to completion. Helper failures
 (e.g. `run_syntax_tests` cannot complete the run) raise and surface
 in this same `error` field — there is no separate helper-level
-error channel.
+error channel. `st_version` (e.g. `4200`) and `st_channel` (e.g.
+`"stable"`, `"dev"`) echo the running Sublime Text build on every
+response, so callers can detect channel mismatches before treating
+scope output as ground truth.
 
 ## Recipes
 
@@ -668,11 +677,23 @@ _HELPERS_CODE = compile(HELPERS_SOURCE, "<sublime-mcp-helpers>", "exec")
 def _exec_on_worker(code):
     """Run `code` on a dedicated daemon thread and collect output.
 
-    Returns a dict with keys `output`, `result`, `error`. `error is None`
-    means the snippet ran to completion.
+    Returns a dict with keys `output`, `result`, `error`, `st_version`,
+    `st_channel`. `error is None` means the snippet ran to completion.
+    `st_version` / `st_channel` echo the running ST build so callers can
+    detect when they're driving (e.g.) ST stable while their question
+    was authored against ST DEV — read per-call so an in-place ST
+    upgrade is reflected without restart.
     """
     done = threading.Event()
-    result = {"output": "", "result": None, "error": None}
+    # ST guarantees `sublime.version()` is a stringified integer; cast
+    # at the boundary so callers don't reparse.
+    result = {
+        "output": "",
+        "result": None,
+        "error": None,
+        "st_version": int(sublime.version()),
+        "st_channel": sublime.channel(),
+    }
 
     def run():
         buf_out = io.StringIO()
@@ -722,11 +743,11 @@ def _exec_on_worker(code):
     worker = threading.Thread(target=run, name="sublime-mcp-exec", daemon=True)
     worker.start()
     if not done.wait(EXEC_TIMEOUT_SECONDS):
-        return {
-            "output": "",
-            "result": None,
-            "error": "exec timed out after %ss" % EXEC_TIMEOUT_SECONDS,
-        }
+        # Reuse the pre-populated `st_version` / `st_channel` from the
+        # initial dict so the envelope shape stays uniform across the
+        # success and timeout paths.
+        result["error"] = "exec timed out after %ss" % EXEC_TIMEOUT_SECONDS
+        return result
     return result
 
 
