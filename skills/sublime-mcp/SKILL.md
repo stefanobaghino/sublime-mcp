@@ -127,27 +127,26 @@ Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one 
 
 `view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
 
-To test a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), symlink it in first:
-
-```bash
-ln -s /path/to/repo/testdata/Packages/Java \
-      "$HOME/Library/Application Support/Sublime Text/Packages/Java"
-```
-
-Then pass the `Packages/...` URI to `resolve_position`:
+For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. The caller builds URIs against it and tears down via `release_packages_link`.
 
 ```python
-r = resolve_position(
-    "/path/to/syntax_test_file", row=71, col=29,
-    syntax_path="Packages/Java/Java.sublime-syntax",
-)
-print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
-assert r["resolved_syntax"] == r["requested_syntax"], r
+name = temp_packages_link("/path/to/repo/testdata/Packages/Java/Java.sublime-syntax")
+try:
+    r = resolve_position(
+        "/path/to/syntax_test_file", row=71, col=29,
+        syntax_path="Packages/%s/Java.sublime-syntax" % name,
+    )
+    print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
+    assert r["resolved_syntax"] == r["requested_syntax"], r
+finally:
+    release_packages_link(name)
 ```
 
 The returned dict also carries `overflow` (past-EOL request wrapped into a later row), `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section. `requested_syntax` echoes the `syntax_path` argument and `resolved_syntax` is `view.syntax().path` — assert they match before treating `scope` as ground truth, since `view.assign_syntax` accepts any string and silently falls through to Plain Text when the URI doesn't resolve.
 
-The symlink is the workaround for `resolve_position`'s `syntax_path` parameter and for `run_syntax_tests` (paths outside the Packages tree raise — there is no fallback, see #51); beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong — `requested_syntax != resolved_syntax` flags this. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that requires helper-managed temporary symlinks (#24). `scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair.
+`temp_packages_link` synthesises a unique nonce-named package, so the bundled `Packages/Java` continues to load alongside it — `requested_syntax != resolved_syntax` still flags any silent fallback to a built-in. The per-syntax mode is sufficient for synthetic probes and single-grammar regression triage; cross-grammar investigations where the testdata grammar embeds another testdata grammar (e.g. C# embedding RegExp) need a whole-tree mirror that shadows the built-ins, tracked separately in §6.
+
+`scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair without needing a symlink. `run_syntax_tests` accepts any path under `sublime.packages_path()` (directly or via symlink); pair it with `temp_packages_link` to cover paths outside the Packages tree.
 
 ### Compare a parser's output against ST
 
@@ -209,8 +208,8 @@ _Last synced with issue state: 2026-05-04._
 
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
-- **#22** — `resolve_position` `syntax_path` accepts filesystem paths (URI flexibility only — does not eliminate the `ln -s` step in §4).
-- **#24** — helper-managed temporary symlinks for repo-local syntaxes. Lands the `ln -s`-elimination half of #9's body. Once landed, the §4 workaround paragraph (and #22 / #24 entries) become removable.
+- **#22** — `resolve_position` `syntax_path` accepts filesystem paths directly (URI flexibility on top of `temp_packages_link`).
+- **whole-tree mirror** (follow-up to #24) — `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
 - **#34** — `find_resources` lists `Packages/...` paths whose `load_resource` raises `FileNotFoundError` (cache-survives-source case observed against `Packages/C#/Embeddings/Regex (for C#).sublime-syntax`); characterise before deciding doc vs code fix.
 
@@ -224,6 +223,7 @@ _Last synced with issue state: 2026-05-04._
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
 - `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
+- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
 

@@ -927,3 +927,166 @@ class TestRunInlineSyntaxTest(HelperTestBase):
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "passed")
         self.assertFalse(os.path.exists(stale))
+
+
+@unittest.skipIf(
+    sys.platform == "win32",
+    "TestTempPackagesLink requires symlink creation, which needs "
+    "SeCreateSymbolicLinkPrivilege or Developer Mode on Windows. "
+    "Same rationale as TestToResourcePathSymlinked.",
+)
+class TestTempPackagesLink(HelperTestBase):
+    """`temp_packages_link` synthesises a managed
+    `Packages/__sublime_mcp_temp_<nonce>__` symlink whose target is a
+    repo-local syntax dir, waits for ST to index the sentinel, returns
+    the synthesised package name. `release_packages_link` tears it
+    down with prefix/suffix validation. Mirrors
+    `TestToResourcePathSymlinked` blast-radius and cleanup discipline.
+    """
+
+    SYNTAX_CONTENT = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: SublimeMcpTempLinkProbe\n"
+        "scope: source.smtlp\n"
+        "file_extensions: [smtlp]\n"
+        "version: 2\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: 'x'\n"
+        "      scope: keyword.smtlp\n"
+    )
+
+    def setUp(self):
+        # Each test gets its own target dir + syntax file. addCleanup
+        # ensures teardown even on partial failure. Defensive sweep at
+        # the start of every test removes any nonce-named link the
+        # helper might have left behind from a prior crash.
+        self._defensive_link_sweep()
+        self.target_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_link_")
+        self.addCleanup(shutil.rmtree, self.target_dir, ignore_errors=True)
+        self.syntax_basename = "Probe.sublime-syntax"
+        self.syntax_path = os.path.join(self.target_dir, self.syntax_basename)
+        with open(self.syntax_path, "w") as f:
+            f.write(self.SYNTAX_CONTENT)
+
+    def _defensive_link_sweep(self):
+        # Same shape as TestToResourcePathSymlinked.setUp's defensive
+        # unlink, scaled to the temp-prefix scheme: any leftover
+        # nonce-named symlink gets removed regardless of age.
+        packages_root = sublime.packages_path()
+        for name in os.listdir(packages_root):
+            if not (name.startswith("__sublime_mcp_temp_") and name.endswith("__")):
+                continue
+            full = os.path.join(packages_root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+
+    def _release(self, name):
+        # Cleanup helper for tests that successfully create a link.
+        # Goes through the MCP boundary so we exercise the public
+        # surface, but tolerates a missing link in case the test
+        # already cleaned up.
+        link_path = os.path.join(sublime.packages_path(), name)
+        if os.path.lexists(link_path) and os.path.islink(link_path):
+            os.unlink(link_path)
+
+    def test_creates_link_with_temp_prefix(self):
+        code = (
+            "_ = temp_packages_link(%r)\n"
+            "print(_)\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name = outcome["output"].strip()
+        self.addCleanup(self._release, name)
+        self.assertTrue(name.startswith("__sublime_mcp_temp_"))
+        self.assertTrue(name.endswith("__"))
+        link_path = os.path.join(sublime.packages_path(), name)
+        self.assertTrue(os.path.islink(link_path))
+        self.assertEqual(os.path.realpath(link_path), os.path.realpath(self.target_dir))
+
+    def test_resource_becomes_findable(self):
+        code = (
+            "name = temp_packages_link(%r)\n"
+            "import json\n"
+            "_ = json.dumps([name, find_resources('Probe.sublime-syntax')])\n"
+            "print(_)\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name, resources = json.loads(outcome["output"].strip())
+        self.addCleanup(self._release, name)
+        expected = "Packages/%s/%s" % (name, self.syntax_basename)
+        self.assertIn(expected, resources)
+
+    def test_release_removes_link(self):
+        code = (
+            "name = temp_packages_link(%r)\n"
+            "release_packages_link(name)\n"
+            "print(name)\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name = outcome["output"].strip()
+        link_path = os.path.join(sublime.packages_path(), name)
+        self.assertFalse(os.path.lexists(link_path))
+
+    def test_release_validates_name_prefix(self):
+        # ValueError on a non-temp name; the assertion is that the
+        # error surfaces AND no Packages/ entry was touched.
+        code = "release_packages_link('Markdown')\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ValueError", outcome["error"])
+        self.assertIn("non-temp", outcome["error"])
+
+    def test_release_idempotent_on_missing(self):
+        # Second release on the same name is a no-op — caller code
+        # using try/finally shouldn't need to track whether the link
+        # was already removed by a sibling sweep.
+        code = (
+            "name = temp_packages_link(%r)\n"
+            "release_packages_link(name)\n"
+            "release_packages_link(name)\n"
+            "print('ok')\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "ok")
+
+    def test_stale_link_swept_on_next_call(self):
+        # Plant a stale temp symlink with mtime 90 s in the past, then
+        # call temp_packages_link; the head-of-call sweep should
+        # remove the planted link before creating the new one.
+        stale_target = tempfile.mkdtemp(prefix="sublime_mcp_test_stale_target_")
+        self.addCleanup(shutil.rmtree, stale_target, ignore_errors=True)
+        stale_link = os.path.join(
+            sublime.packages_path(), "__sublime_mcp_temp_stalelink__"
+        )
+        if os.path.lexists(stale_link):
+            os.unlink(stale_link)
+        os.symlink(stale_target, stale_link)
+        old = time.time() - 90.0
+        os.utime(stale_link, (old, old), follow_symlinks=False)
+        self.addCleanup(
+            lambda: os.path.lexists(stale_link) and os.unlink(stale_link)
+        )
+        code = (
+            "_ = temp_packages_link(%r)\n"
+            "print(_)\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name = outcome["output"].strip()
+        self.addCleanup(self._release, name)
+        self.assertFalse(os.path.lexists(stale_link))
