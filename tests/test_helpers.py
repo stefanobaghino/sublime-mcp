@@ -209,12 +209,19 @@ class TestScopeAtExtensionless(HelperTestBase):
         )
 
     def test_scope_at_returns_text_plain_on_extensionless(self):
-        resp = yield from _call_tool_yielding(
-            "print(scope_at(%r, 1, 0))" % self.fixture_path
+        # Extensionless file → ST falls back to Plain Text. `scope_at`
+        # returns the dict shape; both fields surface the fallback.
+        code = (
+            "import json\n"
+            "_ = scope_at(%r, 1, 0)\n"
+            "print(json.dumps(_))\n" % self.fixture_path
         )
+        resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
-        self.assertEqual(outcome["output"].strip(), "text.plain")
+        r = json.loads(outcome["output"])
+        self.assertEqual(r["scope"], "text.plain")
+        self.assertEqual(r["resolved_syntax"], "Packages/Text/Plain text.tmLanguage")
 
     def test_scope_at_test_parses_header_and_returns_real_scope(self):
         resp = yield from _call_tool_yielding(

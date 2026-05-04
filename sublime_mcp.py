@@ -48,14 +48,18 @@ require the main UI thread (e.g. `TextCommand` edit tokens), use
 The following names are preloaded:
 
 - `sublime`, `sublime_plugin` — the ST Python API modules.
-- `scope_at(path, row, col) -> str` — opens the file, returns
-  `view.scope_name` at the 0-indexed (row, col). Rows and cols are
+- `scope_at(path, row, col) -> dict` — opens the file, returns
+  `{"scope": str, "resolved_syntax": str | None}`. `scope` is
+  `view.scope_name` at the 0-indexed (row, col); rows and cols are
   0-indexed, matching ST's API (a syntax-test assertion on line 181
-  col 9 corresponds to `row=180, col=8`). **Use `scope_at_test` for
-  files with no extension. `scope_at` does not parse the
-  `# SYNTAX TEST` header and will silently return `text.plain` when
-  ST can't infer the syntax from the file name** — a common landmine
-  with `syntax_test_*` files.
+  col 9 corresponds to `row=180, col=8`). `resolved_syntax` is
+  `view.syntax().path` — the URI of the syntax ST actually loaded,
+  or `None` if no syntax resolved (extensionless files, bogus URIs).
+  **Use `scope_at_test` for files with no extension. `scope_at` does
+  not parse the `# SYNTAX TEST` header**: ST falls back to Plain Text
+  (`resolved_syntax == "Packages/Text/Plain text.tmLanguage"`,
+  `scope == "text.plain"`) and the caller can detect this by checking
+  `resolved_syntax`.
 - `scope_at_test(path, row, col) -> str` — like `scope_at`, but
   parses the `SYNTAX TEST "Packages/..."` header on line 0 and
   assigns that syntax to the view before sampling the scope. The
@@ -147,7 +151,8 @@ error channel.
 
 ```python
 # syntax_test_Generics.cs line 181 col 9 → row=180, col=8
-print(scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8))
+r = scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8)
+print(r["scope"], "via", r["resolved_syntax"])
 ```
 
 ### Scope on an extension-less syntax-test file
@@ -312,7 +317,15 @@ def open_view(path, timeout=5.0):
 def scope_at(path, row, col):
     view = open_view(path)
     point = view.text_point(row, col)
-    return view.scope_name(point).rstrip()
+    # `view.syntax()` returns None when ST didn't actually load a syntax —
+    # the honest signal. `view.settings().get("syntax")` echoes any
+    # `assign_syntax` argument verbatim, even bogus ones, so it can't tell
+    # silent-fallback-to-plain apart from a genuine plain-text resolution.
+    syntax = view.syntax()
+    return {
+        "scope": view.scope_name(point).rstrip(),
+        "resolved_syntax": syntax.path if syntax is not None else None,
+    }
 
 
 def assign_syntax_and_wait(view, resource_path, timeout=2.0):
