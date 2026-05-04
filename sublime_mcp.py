@@ -86,7 +86,9 @@ them in `run_on_main(...)`. The following names are preloaded:
   `RuntimeError`, surfaced in the top-level `error` field of the
   MCP response — the same channel any other helper failure uses.
   Files outside Packages/ must be symlinked in (the helper walks
-  symlinks); see SKILL.md section 4.
+  symlinks); see SKILL.md section 4. Files with thousands of
+  assertions can exceed the 60 s ceiling on the runner itself;
+  see SKILL.md section 4 for the per-position-probe workaround.
 - `run_inline_syntax_test(content, name) -> dict` — for synthetic
   probes ("what does ST do on this case?"). Writes `content` to a
   per-call temp dir under `Packages/User/`, runs ST's syntax-test

@@ -213,6 +213,21 @@ _ = candidates
 
 The filter is not pushed inside `find_resources` itself: silent filtering would mask the underlying ST behaviour and cost a `load_resource` per entry on every listing.
 
+### Probe a large syntax-test file in pieces
+
+`run_syntax_tests` drives the private `sublime_api.run_syntax_test`, which is synchronous. For files with thousands of assertions (e.g. `~14k` on a large grammar's `syntax_test_*` fixture) the runner exceeds the 60 s `EXEC_TIMEOUT_SECONDS` ceiling on `exec_sublime_python` and the call returns with `error: "exec timed out after 60s"` rather than a structured `failed` / `passed` payload. No `timeout` parameter on `run_syntax_tests` rescues this — the ceiling is on the snippet call, not the helper.
+
+When that happens, enumerate failing positions externally and probe each one:
+
+```python
+# failing_positions = [(row, col), ...] — produced separately, e.g. by
+# syntect's examples/syntest harness against the same file.
+results = [scope_at_test("/abs/path/to/syntax_test_huge", r, c) for r, c in failing_positions]
+_ = results
+```
+
+`scope_at_test` reads the `# SYNTAX TEST` header and assigns the syntax once per call; the loop pays a one-time tokenisation on first call and then runs at the per-`scope_name` rate noted in *Bulk probes* above. Each call is independent of the 60 s budget.
+
 ## 5. Output discipline
 
 - **Return raw scopes.** `source.python keyword.control.flow` is the answer — don't paraphrase to "it's a Python keyword in a control-flow context." The caller can read the scope; paraphrase drops information.
