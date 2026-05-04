@@ -195,6 +195,24 @@ _ = scopes  # returns via `result`
 
 Measured per-call latency is tracked in #10.
 
+### Filter find_resources output through load_resource
+
+`find_resources` reports whatever ST's resource index says exists, which can lag behind reality. A path like `Packages/C#/Embeddings/Regex (for C#).sublime-syntax` may appear in the listing yet raise `FileNotFoundError` from `sublime.load_resource(...)` when the underlying file is gone (cache survives source). Filter at the call site:
+
+```python
+def _safe_load(p):
+    try:
+        sublime.load_resource(p)
+        return True
+    except FileNotFoundError:
+        return False
+
+candidates = [p for p in find_resources("*.sublime-syntax") if _safe_load(p)]
+_ = candidates
+```
+
+The filter is not pushed inside `find_resources` itself: silent filtering would mask the underlying ST behaviour and cost a `load_resource` per entry on every listing.
+
 ## 5. Output discipline
 
 - **Return raw scopes.** `source.python keyword.control.flow` is the answer — don't paraphrase to "it's a Python keyword in a control-flow context." The caller can read the scope; paraphrase drops information.
@@ -211,7 +229,7 @@ _Last synced with issue state: 2026-05-04._
 - **#22** — `resolve_position` `syntax_path` accepts filesystem paths directly (URI flexibility on top of `temp_packages_link`).
 - **whole-tree mirror** (follow-up to #24) — `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
-- **#34** — `find_resources` lists `Packages/...` paths whose `load_resource` raises `FileNotFoundError` (cache-survives-source case observed against `Packages/C#/Embeddings/Regex (for C#).sublime-syntax`); characterise before deciding doc vs code fix.
+- **#34** — `find_resources` can list stale `Packages/...` paths whose `load_resource` raises `FileNotFoundError`; documented in §4 ("Filter find_resources output through load_resource").
 
 ## 7. Reference — preloaded helpers
 
