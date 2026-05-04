@@ -763,3 +763,51 @@ class TestRunOnMain(HelperTestBase):
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "5")
+
+
+class TestWaitForResource(HelperTestBase):
+    """`_wait_for_resource` widened from 1.0 s to 3.0 s and gained a
+    one-shot `refresh_folder_list` nudge past two-thirds of the budget
+    (#6). The signature default is the externally-visible contract;
+    the refresh is the structural change.
+    """
+
+    def test_default_timeout_is_three_seconds(self):
+        # The default reaches every transitive caller — _run_syntax_tests_via_api
+        # at sublime_mcp.py:518 inherits it without naming it, so the
+        # signature itself is the right anchor.
+        code = (
+            "import inspect\n"
+            "_ = inspect.signature(_wait_for_resource).parameters['timeout'].default\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "3.0")
+
+    def test_refresh_folder_list_fires_after_two_thirds(self):
+        # Patch sublime.run_command so the test doesn't actually nudge
+        # ST's indexer. 0.3 s budget → refresh at ~0.2 s → ~0.1 s of
+        # post-refresh polling before the deadline. The set_timeout
+        # dispatch is async; sleep within the patch context after the
+        # wait returns so the lambda has time to land on main.
+        code = (
+            "import time\n"
+            "import unittest.mock\n"
+            "calls = []\n"
+            "with unittest.mock.patch.object(sublime, 'run_command', new=lambda *a, **k: calls.append(a)):\n"
+            "    found = _wait_for_resource('Packages/__sublime_mcp_nonexistent__/x.bar', timeout=0.3)\n"
+            "    time.sleep(0.3)\n"
+            "print(found)\n"
+            "print(calls)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "False")
+        # Single call to run_command with positional arg "refresh_folder_list".
+        self.assertIn("refresh_folder_list", lines[1])
+        # Make sure it fired exactly once, not on every poll iteration.
+        self.assertEqual(lines[1].count("refresh_folder_list"), 1)

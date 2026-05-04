@@ -191,7 +191,6 @@ Measured per-call latency is tracked in #10.
 
 _Last synced with issue state: 2026-05-04._
 
-- **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
 - **#22** — `resolve_position` `syntax_path` accepts filesystem paths (URI flexibility only — does not eliminate the `ln -s` step in §4).
