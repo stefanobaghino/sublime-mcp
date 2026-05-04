@@ -412,8 +412,7 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
         # that doesn't exist on disk. _to_resource_path maps it to a
         # Packages/... URI, sublime_api.run_syntax_test reports "unable
         # to read file", _wait_for_resource times out without the
-        # resource appearing in the index, and the API path raises
-        # rather than silently falling through to the build-panel path.
+        # resource appearing in the index, and the API path raises.
         bogus = os.path.join(
             sublime.packages_path(), "__sublime_mcp_unindexed__", "syntax_test_nope"
         )
@@ -436,69 +435,12 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
         return json.loads(outcome["output"])
 
 
-class TestRunSyntaxTestsFallback(HelperTestBase):
-    """Fallback path kicks in for files outside `sublime.packages_path()`.
-    The critical contract: never return a silent empty result."""
-
-    def test_failed_line_regex_discriminates_canonical_from_fixture_content(self):
-        # Direct in-namespace check on the strict regex's discrimination.
-        # Catches a regex regression even in environments where the build
-        # variant doesn't surface a panel (so the end-to-end populated-
-        # output test below skips).
-        code = (
-            "import json\n"
-            "_ = json.dumps({\n"
-            "    'canonical': bool(_FAILED_LINE_RE.match("
-            "'FAILED: 2 of 5 assertions failed')),\n"
-            "    'truncated': bool(_FAILED_LINE_RE.match('FAILED:')),\n"
-            "    'fixture_content': bool(_FAILED_LINE_RE.match("
-            "'FAILED to do something')),\n"
-            "    'passed_line': bool(_FAILED_LINE_RE.match("
-            "'5 assertions passed')),\n"
-            "})\n"
-            "print(_)\n"
-        )
-        resp = yield from _call_tool_yielding(code)
-        outcome = _outcome(resp)
-        self.assertIsNone(outcome["error"], outcome.get("error"))
-        r = json.loads(outcome["output"])
-        self.assertTrue(r["canonical"])
-        self.assertFalse(r["truncated"])
-        self.assertFalse(r["fixture_content"])
-        self.assertFalse(r["passed_line"])
-
-    def test_failing_fixture_returns_populated_failures(self):
-        # End-to-end: drive the build path against a real failing fixture
-        # and verify populated `failures`. Skipped on sessions where ST's
-        # "Syntax Tests" build system doesn't surface a panel — a known
-        # #17-shaped issue where run_syntax_tests now raises. The
-        # in-namespace regex test above covers regex regressions that
-        # would otherwise slip through this skip.
-        fd, path = tempfile.mkstemp(suffix=".py")
-        os.close(fd)
-        try:
-            with open(path, "w") as f:
-                f.write(HEADER)
-                f.write("x = 1\n# ^ keyword.control.flow\n")  # fails
-            code = (
-                "import json\n"
-                "_ = run_syntax_tests(%r, timeout=10.0)\n"
-                "print(json.dumps(_))\n" % path
-            )
-            resp = yield from _call_tool_yielding(code)
-            outcome = _outcome(resp)
-            if outcome["error"] is not None:
-                self.skipTest(
-                    "build path raised; populated-output coverage "
-                    "requires the Syntax Tests build system to surface a "
-                    "panel: %s" % outcome["error"].splitlines()[-1]
-                )
-            r = json.loads(outcome["output"])
-            self.assertEqual(r["state"], "failed", r)
-            self.assertGreater(len(r["failures"]), 0, r)
-            self.assertIn("FAILED", r["failures"][0])
-        finally:
-            os.unlink(path)
+class TestRunSyntaxTestsOutsidePackages(HelperTestBase):
+    """Paths outside `sublime.packages_path()` raise loudly. Programmatic
+    dispatch of the Syntax Tests build system never fires the runner
+    (#51), so there is no working fallback — the helper raises with a
+    pointer at the symlink workaround instead of silently returning
+    empty."""
 
     def test_outside_packages_describes_cause(self):
         fd, path = tempfile.mkstemp(suffix=".txt")
@@ -506,14 +448,16 @@ class TestRunSyntaxTestsFallback(HelperTestBase):
         try:
             with open(path, "w") as f:
                 f.write("just text\n")
-            code = "_ = run_syntax_tests(%r, timeout=3.0)\n" % path
+            code = "_ = run_syntax_tests(%r)\n" % path
             resp = yield from _call_tool_yielding(code)
             outcome = _outcome(resp)
             self.assertIsNotNone(outcome["error"])
-            # All three build-path raise sites name the build system;
-            # pin against the shared substring so a regression to
-            # generic-but-wrong prose fails the test.
-            self.assertIn("Syntax Tests build system", outcome["error"])
+            # Pin against substrings the helper actually produces, so a
+            # regression to generic-but-wrong prose fails the test. The
+            # path is interpolated; "symlink" names the workaround.
+            self.assertIn(path, outcome["error"])
+            self.assertIn("symlink", outcome["error"])
+            self.assertIn("Packages/", outcome["error"])
         finally:
             os.unlink(path)
 
