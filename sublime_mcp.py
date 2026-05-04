@@ -589,15 +589,31 @@ def _is_unable_to_read(messages):
     return any("unable to read file" in m for m in messages)
 
 
-def _wait_for_resource(resource_path, timeout=1.0):
-    # ST's resource index can lag behind the filesystem by a few hundred
-    # ms on newly-created files; poll find_resources until the resource
-    # becomes visible.
+def _wait_for_resource(resource_path, timeout=3.0):
+    # ST's resource index can lag behind the filesystem by seconds, not
+    # milliseconds, on cold-disk or post-write indexing — one observed
+    # cold-register latency was 15 s for a freshly-written
+    # .sublime-syntax (#6). Default budget bumped from 1.0 s to 3.0 s
+    # to cover the realistic upper bound of common cases without
+    # waiting forever on genuine misses.
+    # Past two-thirds of the budget without resolution, fire one
+    # `refresh_folder_list` to nudge ST's indexer; idempotent and
+    # bounded by the same total budget. Dispatched through set_timeout
+    # because run_command is application-level and the safe default
+    # off the worker thread is main-thread scheduling.
     basename = resource_path.rsplit("/", 1)[-1]
-    deadline = _time.time() + timeout
+    start = _time.time()
+    deadline = start + timeout
+    refresh_threshold = start + (timeout * 2.0 / 3.0)
+    refreshed = False
     while _time.time() < deadline:
         if resource_path in sublime.find_resources(basename):
             return True
+        if not refreshed and _time.time() >= refresh_threshold:
+            sublime.set_timeout(
+                lambda: sublime.run_command("refresh_folder_list"), 0
+            )
+            refreshed = True
         _time.sleep(0.02)
     return False
 
