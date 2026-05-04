@@ -43,9 +43,8 @@ capture its output.
 The snippet runs on a dedicated daemon thread so it can wait on file
 loads and build panels without deadlocking ST's UI. Most of the ST
 API is thread-safe from any thread; for the few operations that
-require the main UI thread (e.g. `TextCommand` edit tokens), use
-`sublime.set_timeout(lambda: ..., 0)` inside the snippet and poll.
-The following names are preloaded:
+require the main UI thread (e.g. `TextCommand` edit tokens), wrap
+them in `run_on_main(...)`. The following names are preloaded:
 
 - `sublime`, `sublime_plugin` — the ST Python API modules.
 - `scope_at(path, row, col) -> dict` — opens the file, returns
@@ -101,6 +100,11 @@ The following names are preloaded:
   deterministic; stage 2 (tokenisation) is best-effort — ST has no
   public tokenisation-complete signal. For large files, re-read
   `scope_name` after use rather than trusting the helper.
+- `run_on_main(callable, timeout=2.0)` — schedules `callable` on
+  ST's main thread, waits for it to finish, returns its value (or
+  re-raises whatever it raised). Use it for buffer-mutating
+  `TextCommand` calls (`view.run_command("append", ...)` and friends)
+  which silently no-op when invoked from the worker thread.
 
 ## text_point overflow
 
@@ -248,15 +252,29 @@ v = w.active_view()
 print(v.file_name(), v.sel()[0], v.scope_name(v.sel()[0].a))
 ```
 
+### Mutate a buffer from a snippet
+
+`view.run_command(...)` requires ST's main thread. Wrap it in
+`run_on_main` — direct calls from the worker thread silently no-op.
+
+```python
+v = sublime.active_window().new_file()
+run_on_main(lambda: v.run_command("append", {"characters": "hello"}))
+print(v.size())  # 5
+v.set_scratch(True)
+v.close()
+```
+
 ## Gotchas
 
 - Hard timeout per call is 60 s.
 - The snippet runs on a dedicated daemon thread (not ST's async
   worker and not the main UI thread). Most of the ST API is
   thread-safe, but a few mutating operations (`TextCommand` edit
-  tokens) require the main thread — call
-  `sublime.set_timeout(lambda: ..., 0)` from within the snippet if
-  you need that, and poll for completion.
+  tokens) require the main thread. Use `run_on_main(callable)` —
+  it owns the `set_timeout` schedule, the completion signal, and
+  the timeout error path. Direct calls to `view.run_command(...)`
+  from the worker thread silently no-op.
 - File paths must be absolute for `scope_at` / `scope_at_test` /
   `resolve_position` / `run_syntax_tests` / `open_view`.
   `find_resources` uses ST's `Packages/...` virtual paths, and
@@ -437,6 +455,34 @@ def reload_syntax(resource_path):
 
 def find_resources(pattern):
     return list(sublime.find_resources(pattern))
+
+
+def run_on_main(callable_, timeout=2.0):
+    # Snippets exec on a worker thread. ST's TextCommand edit tokens
+    # (and a handful of other mutating operations) silently no-op when
+    # called off the main thread — view.run_command(...) returns
+    # cleanly, view.size() reports zero. Schedule on the main thread
+    # via set_timeout, signal completion through threading.Event, then
+    # propagate the return value or re-raise the exception on the
+    # worker thread so traceback capture in _exec_on_worker sees it.
+    import threading as _threading
+    done = _threading.Event()
+    box = {}
+    def runner():
+        try:
+            box["result"] = callable_()
+        except BaseException as exc:
+            box["exc"] = exc
+        finally:
+            done.set()
+    sublime.set_timeout(runner, 0)
+    if not done.wait(timeout):
+        raise TimeoutError(
+            "run_on_main: callable did not complete within %ss" % timeout
+        )
+    if "exc" in box:
+        raise box["exc"]
+    return box.get("result")
 
 
 def _to_resource_path(path):
