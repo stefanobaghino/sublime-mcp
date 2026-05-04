@@ -262,6 +262,38 @@ r = run_inline_syntax_test(
 print(r["state"], r["summary"])
 ```
 
+`run_inline_syntax_test` writes only the *test file*; the syntax must
+already be reachable to ST (bundled or via `temp_packages_link`). When
+the syntax is also synthetic, see "Probe a synthetic syntax against a
+synthetic input" below.
+
+### Probe a synthetic syntax against a synthetic input
+
+```python
+# /tmp/probe/Foo.sublime-syntax and /tmp/probe/test.foo already written.
+input_text = "AB"
+name = temp_packages_link("/tmp/probe")          # directory form
+syntax_uri = "Packages/%s/Foo.sublime-syntax" % name
+try:
+    chains = []
+    for c in range(len(input_text)):
+        r = resolve_position("/tmp/probe/test.foo", 0, c, syntax_path=syntax_uri)
+        assert r["resolved_syntax"] == r["requested_syntax"], r
+        chains.append(r["scope"])
+finally:
+    release_packages_link(name)
+_ = chains
+```
+
+`resolve_position` over `scope_at`: it surfaces `requested_syntax` /
+`resolved_syntax`, so a typo in the synthetic syntax that makes ST
+silently fall back to Plain Text trips the assertion. The input file
+does not need to live under the symlinked dir — only the syntax does;
+the link's job is to make `view.assign_syntax` resolve. For
+iterating one-rule variants of the same syntax, overwrite the file
+under the link and call `reload_syntax(syntax_uri)` between sweeps
+rather than tearing down and re-linking.
+
 ### Probe a repo-local syntax
 
 ```python

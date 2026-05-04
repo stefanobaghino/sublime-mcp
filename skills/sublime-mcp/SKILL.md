@@ -67,7 +67,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
-**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping.
+**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
 
 ## 4. Recipes
 
@@ -118,7 +118,7 @@ When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and th
 
 ### Probe a synthetic case inline
 
-For "what does ST do on this case?" probes, `run_inline_syntax_test(content, name)` owns the file-write, indexing wait, runner call, and cleanup. The header inside `content` selects the syntax under test; the syntax must already be reachable to ST (bundled or via `temp_packages_link`).
+For "what does ST do on this case?" probes against a syntax that's *already reachable to ST* — bundled, or linked into `Packages/` via `temp_packages_link` — `run_inline_syntax_test(content, name)` owns the file-write, indexing wait, runner call, and cleanup. The header inside `content` selects the syntax under test.
 
 ```python
 r = run_inline_syntax_test(
@@ -131,6 +131,34 @@ print(r["state"], r["summary"])
 ```
 
 Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one extra state `"inconclusive"` when ST never indexes the temp resource within the wait budget. The probe's temp dir is removed on every code path (within-call `try/finally`); a cross-call sweep at the start of each call cleans up SIGKILL-orphaned dirs older than 60 s.
+
+This helper writes only the *test file*. When the syntax under test is also synthetic, pair `temp_packages_link` (own the syntax) with `resolve_position` / `scope_at` (sample the input) — see the next recipe.
+
+### Probe a synthetic syntax against a synthetic input
+
+When *both* the syntax and the input it's probed against are synthetic — "I just authored this syntax in `/tmp`; what scope does ST assign at row R col C of this synthetic input string?" — neither `run_inline_syntax_test` (test-file only) nor the existing `temp_packages_link` recipe (existing input file) covers it on its own. Compose them: `temp_packages_link(dir)` to own the syntax, write the input under any path, sweep `resolve_position` for scope-at-point.
+
+```python
+# /tmp/probe/Foo.sublime-syntax and /tmp/probe/test.foo already written.
+input_text = "AB"
+name = temp_packages_link("/tmp/probe")          # directory form: links the dir directly
+syntax_uri = "Packages/%s/Foo.sublime-syntax" % name
+try:
+    chains = []
+    for c in range(len(input_text)):
+        r = resolve_position("/tmp/probe/test.foo", 0, c, syntax_path=syntax_uri)
+        assert r["resolved_syntax"] == r["requested_syntax"], r
+        chains.append(r["scope"])
+finally:
+    release_packages_link(name)
+_ = chains
+```
+
+`resolve_position` over `scope_at` here: it surfaces `requested_syntax` / `resolved_syntax`, so a typo in the synthetic syntax that makes ST silently fall back to Plain Text trips the assertion instead of returning misleading scopes. The input file does not need to live under the symlinked dir — `resolve_position` opens any filesystem path. Co-locating it next to the syntax (as above) is a cleanup convention, not a requirement; the link only exists so ST can resolve the synthetic syntax.
+
+For iterating one-rule variants of the same syntax, overwrite `Foo.sublime-syntax` under the link between sweeps and call `reload_syntax(syntax_uri)` to force ST to reparse — cheaper than tearing down and re-linking.
+
+When ST is headless (no window), `resolve_position` and the `scope_at` family raise — see #66 for the runner-driven scope-chain extraction recipe.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
@@ -262,7 +290,7 @@ _Last synced with issue state: 2026-05-04._
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
 - `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
-- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`.
+- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
 
