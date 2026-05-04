@@ -334,6 +334,12 @@ v.close()
 ## Gotchas
 
 - Hard timeout per call is 60 s.
+- A `view.scope_name(point)` call on an already-tokenised view costs
+  around 150 µs (measured: 5 × 500-sample medians on a 1.2k-line
+  Python source view, ST 4200 stable); a several-hundred-position
+  sweep fits the 60 s ceiling with three orders of magnitude of
+  headroom. The cold-view cost is a one-time tokenisation pass on
+  the first helper call against a given path.
 - The snippet runs on a dedicated daemon thread (not ST's async
   worker and not the main UI thread). Most of the ST API is
   thread-safe, but a few mutating operations (`TextCommand` edit
