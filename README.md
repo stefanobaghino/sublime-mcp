@@ -42,13 +42,15 @@ directly.
 ```sh
 git clone https://github.com/stefanobaghino/sublime-mcp
 cd sublime-mcp
-pipx install -e .
+uv tool install --editable .
 ```
 
-`pipx install -e .` keeps `sublime-mcp` pointing at this checkout
-(the harness reads the bundled `Dockerfile`, `docker/entrypoint.sh`,
-and `sublime_mcp.py` from `Path(__file__).parent`). Plain
-`pip install -e .` works too if you already have a managed environment.
+`uv tool install --editable .` keeps `sublime-mcp` pointing at this
+checkout (the harness reads the bundled `Dockerfile`,
+`docker/entrypoint.sh`, and `sublime_mcp.py` from
+`Path(__file__).parent`, which an editable install resolves back to the
+source directory). `pipx install -e .` and plain `pip install -e .`
+work too if you already have one of those set up.
 
 ## Register with Claude Code
 
@@ -175,6 +177,6 @@ the harness is the supported user path.
 
 ```sh
 claude mcp remove sublime-text --scope user
-pipx uninstall sublime-mcp-harness
+uv tool uninstall sublime-mcp-harness
 docker image rm sublime-mcp-harness:latest
 ```
