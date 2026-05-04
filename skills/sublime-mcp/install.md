@@ -41,7 +41,7 @@ open -a "Sublime Text"
 # universal CLI helper.
 ```
 
-To reproduce headlessness deliberately and verify the guard end-to-end (macOS recipe — Linux/Windows have no equivalent for AppleScript-driven window control, so verify there by quitting all windows manually instead):
+To reproduce headlessness deliberately and verify the guard end-to-end (macOS recipe — Linux/Windows have no equivalent for AppleScript-driven window control, so verify there by quitting all windows manually instead). The scenario is also automated as `tests/headless_smoke.py`, which drives ST through MCP rather than AppleScript and so works on any platform; CI runs it on macOS via `.github/workflows/headless.yml`.
 
 ```bash
 # Step 1. Save or discard any unsaved work — the close call below is a
