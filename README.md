@@ -109,7 +109,7 @@ Two suites, both running inside Sublime Text via the
   `ok` dropped, `error` populated on exception), `scope_at` vs
   `scope_at_test` on extension-less files, `resolve_position`'s
   overflow / clamped matrix, `run_syntax_tests` via
-  `sublime_api.run_syntax_test` and the build-panel fallback, and
+  `sublime_api.run_syntax_test` (and its outside-Packages raise), and
   `_to_resource_path` edge cases.
 
 ### Locally
