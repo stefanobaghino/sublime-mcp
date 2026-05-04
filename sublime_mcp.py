@@ -402,9 +402,38 @@ except ImportError:
 _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
 
 
+# Seams for ST module-level reads. Helpers call these instead of
+# `sublime.active_window()` / `sublime.windows()` / `_os.listdir` against
+# packages_path() so tests can override the seam in the snippet's
+# globals — narrower blast radius than `patch.object(sublime, ...)`,
+# which mutates the module attribute for every consumer in the plugin
+# host (autosave timers, indexers, concurrent MCP requests).
+def _get_active_window():
+    return sublime.active_window()
+
+
+def _get_windows():
+    return sublime.windows()
+
+
+def _list_packages_entries(packages_root):
+    # Returns `[(name, full_path), ...]` for directory entries under
+    # `packages_root`. The per-entry `islink` / `realpath` filtering
+    # stays in the caller (`_to_resource_path`), so the seam is just the
+    # directory enumeration boundary. Tests inject synthetic entries to
+    # exercise the symlink-walk branches without touching the real
+    # filesystem; the test fixture and ST's resource indexer both still
+    # see the same `packages_path()`.
+    try:
+        names = _os.listdir(packages_root)
+    except OSError:
+        return []
+    return [(name, _os.path.join(packages_root, name)) for name in names]
+
+
 def open_view(path, timeout=5.0):
-    window = sublime.active_window()
-    if window is None or len(sublime.windows()) == 0:
+    window = _get_active_window()
+    if window is None or len(_get_windows()) == 0:
         raise RuntimeError(
             "open_view: Sublime Text has no open window. The plugin host is "
             "running but headless. Launch ST with a window (e.g. "
@@ -540,7 +569,7 @@ def reload_syntax(resource_path):
     # we leverage the fact that ST reloads a syntax when a view using it
     # is reactivated after the resource changes. The pragmatic workaround
     # is to re-open any view bound to the syntax.
-    for window in sublime.windows():
+    for window in _get_windows():
         for view in window.views():
             settings = view.settings()
             if settings.get("syntax") == resource_path:
@@ -610,13 +639,8 @@ def _to_resource_path(path):
     # would silently return wrong URIs (or None for a newly-added
     # symlink). One listdir on a small directory is cheap; correctness
     # wins.
-    try:
-        entries = _os.listdir(packages_root)
-    except OSError:
-        return None
     abs_path_real = _os.path.realpath(abs_path)
-    for name in entries:
-        entry_path = _os.path.join(packages_root, name)
+    for name, entry_path in _list_packages_entries(packages_root):
         if not _os.path.islink(entry_path):
             continue
         try:
@@ -777,7 +801,10 @@ def _wait_for_resource(resource_path, timeout=3.0):
     refresh_threshold = start + (timeout * 2.0 / 3.0)
     refreshed = False
     while _time.time() < deadline:
-        if resource_path in sublime.find_resources(basename):
+        # Go through the find_resources wrapper rather than calling
+        # sublime.find_resources directly so the wrapper actually
+        # serves as the single chokepoint tests can override.
+        if resource_path in find_resources(basename):
             return True
         if not refreshed and _time.time() >= refresh_threshold:
             sublime.set_timeout(
