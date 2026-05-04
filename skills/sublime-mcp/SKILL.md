@@ -68,10 +68,13 @@ Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed*
 ### Scope at a position
 
 ```python
-print(scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8))
+r = scope_at("/path/to/Packages/C#/tests/syntax_test_Generics.cs", 180, 8)
+print(r["scope"], "via", r["resolved_syntax"])
 ```
 
-**Landmine: extension-less syntax-test files** (`syntax_test_git_config`, no suffix) silently return `text.plain` via `scope_at`, because ST can't infer the syntax from the filename. Use `scope_at_test` — it parses the `# SYNTAX TEST "Packages/..."` header and assigns that syntax before sampling.
+`scope_at` returns `{"scope": str, "resolved_syntax": str | None}`. `resolved_syntax` is the URI ST actually loaded (`view.syntax().path`) — `None` when no syntax resolved, `"Packages/Text/Plain text.tmLanguage"` when ST defaulted to Plain Text. Branch on `resolved_syntax` to detect silent fallback before treating `scope` as ground truth.
+
+**Landmine: extension-less syntax-test files** (`syntax_test_git_config`, no suffix) silently fall back to Plain Text via `scope_at` — `scope == "text.plain"` and `resolved_syntax == "Packages/Text/Plain text.tmLanguage"`. Use `scope_at_test` — it parses the `# SYNTAX TEST "Packages/..."` header and assigns that syntax before sampling.
 
 ```python
 print(scope_at_test("/path/to/syntax_test_git_config", 71, 28))
@@ -153,7 +156,7 @@ If step 3 passes, the downstream parser diverges from ST — file the bug agains
 `scope_name` on an already-tokenised view is thread-safe and runs concurrent with ST's UI, so a several-hundred-row sweep in one `exec_sublime_python` call comfortably fits the 60 s per-call budget. The cold-view cost is a one-time tokenisation pass on the first helper call against a given path.
 
 ```python
-scopes = [scope_at("/path/to/big_file", row, 0) for row in range(3020, 3039)]
+scopes = [scope_at("/path/to/big_file", row, 0)["scope"] for row in range(3020, 3039)]
 _ = scopes  # returns via `result`
 ```
 
@@ -183,7 +186,7 @@ _Last synced with issue state: 2026-04-28._
 
 ## 7. Reference — preloaded helpers
 
-- `scope_at(path, row, col) -> str` — open file, return `view.scope_name` at point. Silently wrong on extension-less files.
+- `scope_at(path, row, col) -> dict` — open file, return `{"scope", "resolved_syntax"}`. `resolved_syntax` is `view.syntax().path` (or `None`); compare against the canonical plain-text URI to detect extension-less / no-syntax fallback.
 - `scope_at_test(path, row, col) -> str` — parse `# SYNTAX TEST` header, assign that syntax, return scope. Right for extension-less syntax-test files.
 - `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags.
 - `run_syntax_tests(path, timeout=30.0) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`.
