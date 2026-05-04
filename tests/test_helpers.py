@@ -422,6 +422,61 @@ class TestRunSyntaxTestsApiPath(HelperTestBase):
         self.assertIsNotNone(outcome["error"])
         self.assertIn("not indexed", outcome["error"])
 
+    def test_failure_carries_structured_field(self):
+        path = self._write_fixture(
+            "syntax_test_struct",
+            HEADER
+            + "x = 1\n# ^ source.python\n"
+            + "y = 2\n# ^ keyword.control.flow\n",
+        )
+        r = yield from self._run(path)
+        self.assertEqual(r["state"], "failed", r)
+        self.assertEqual(len(r["failures_structured"]), 1, r)
+        s = r["failures_structured"][0]
+        self.assertIsNotNone(s["file"], s)
+        self.assertTrue(s["file"].endswith("syntax_test_struct"), s)
+        self.assertIsInstance(s["row"], int)
+        self.assertIsInstance(s["col"], int)
+        self.assertEqual(s["error_label"], "scope does not match", s)
+        self.assertEqual(s["expected_selector"], "keyword.control.flow", s)
+        self.assertGreaterEqual(len(s["actual"]), 1, s)
+        self.assertIn("source.python", s["actual"][0]["scope_chain"])
+
+    def test_passed_run_has_empty_structured_failures(self):
+        path = self._write_fixture(
+            "syntax_test_pass_struct",
+            HEADER + "x = 1\n# ^ source.python\n",
+        )
+        r = yield from self._run(path)
+        self.assertEqual(r["state"], "passed", r)
+        self.assertEqual(r["failures_structured"], [])
+
+    def test_structured_parser_does_not_raise_on_unparseable(self):
+        # _parse_failure_message is in the helper namespace; call it
+        # directly with deliberately-malformed inputs to assert never-
+        # raises and that every result carries the documented keys.
+        code = (
+            "import json\n"
+            "probes = [\n"
+            "    '',\n"
+            "    'garbage',\n"
+            "    'no:colons here',\n"
+            "    'a:b:c\\nerror: x\\nactual:\\n  | ^ s\\n',\n"
+            "]\n"
+            "_ = [_parse_failure_message(p) for p in probes]\n"
+            "print(json.dumps(_))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        parsed = json.loads(outcome["output"])
+        self.assertEqual(len(parsed), 4)
+        expected_keys = {
+            "file", "row", "col", "error_label", "expected_selector", "actual",
+        }
+        for entry in parsed:
+            self.assertEqual(set(entry.keys()), expected_keys, entry)
+
     def _run(self, path):
         # Generator: callers must `yield from self._run(...)`.
         code = (

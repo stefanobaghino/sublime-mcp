@@ -73,14 +73,19 @@ them in `run_on_main(...)`. The following names are preloaded:
   `requested_syntax` (echo of the `syntax_path` arg, or `None`) and
   `resolved_syntax` (ST's `view.syntax().path`, or `None`).
 - `run_syntax_tests(path) -> dict` — returns
-  `{"state": str, "summary": str, "output": str, "failures": list[str]}`.
+  `{"state": str, "summary": str, "output": str,
+    "failures": list[str], "failures_structured": list[dict]}`.
   `state` is one of `"passed"` (all assertions matched) or
   `"failed"` (the runner completed but some assertions did not
   match). `summary` is an assertion-count headline. `failures` is
   one entry per failed assertion with ST's own diagnostic
   (file:row:col, "error: scope does not match", then the
   expected/actual snippet); populated only when
-  `state == "failed"`. Cases where ST cannot complete the run
+  `state == "failed"`. `failures_structured` is the same list parsed
+  into `{file, row, col, error_label, expected_selector,
+  actual: [{col_range, scope_chain}, ...]}` dicts — best-effort
+  enrichment for programmatic consumers, with `failures` as the
+  canonical record on parser miss. Cases where ST cannot complete the run
   (resource not yet indexed, path outside `sublime.packages_path()`,
   private `sublime_api.run_syntax_test` missing) raise
   `RuntimeError`, surfaced in the top-level `error` field of the
@@ -96,7 +101,8 @@ them in `run_on_main(...)`. The following names are preloaded:
 - `run_inline_syntax_test(content, name) -> dict` — for synthetic
   probes ("what does ST do on this case?"). Writes `content` to a
   per-call temp dir under `Packages/User/`, runs ST's syntax-test
-  runner, cleans up. Same `{state, summary, output, failures}`
+  runner, cleans up. Same
+  `{state, summary, output, failures, failures_structured}`
   contract as `run_syntax_tests`, plus a third state
   `"inconclusive"` when ST never indexes the temp resource within
   the wait budget (looser than `run_syntax_tests`, which raises —
@@ -658,7 +664,83 @@ def _run_syntax_tests_via_api(path):
         "summary": summary,
         "output": "\n".join(failures) if failures else summary,
         "failures": failures,
+        "failures_structured": [_parse_failure_message(m) for m in failures],
     }
+
+
+def _parse_failure_message(msg):
+    # Best-effort parser for the multi-line strings sublime_api.run_syntax_test
+    # returns. The format is undocumented (private API) so the parser never
+    # raises: on any unexpected shape, the dict carries None / empty fields and
+    # the raw string remains the canonical record under `failures`.
+    out = {
+        "file": None,
+        "row": None,
+        "col": None,
+        "error_label": "",
+        "expected_selector": None,
+        "actual": [],
+    }
+    if not msg:
+        return out
+    lines = msg.splitlines()
+    if not lines:
+        return out
+    head = lines[0]
+    parts = head.rsplit(":", 2)
+    if len(parts) == 3:
+        out["file"] = parts[0] or None
+        try:
+            out["row"] = int(parts[1])
+            out["col"] = int(parts[2])
+        except ValueError:
+            pass
+    if len(lines) > 1 and lines[1].startswith("error:"):
+        out["error_label"] = lines[1].split(":", 1)[1].strip()
+    actual_idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == "actual:":
+            actual_idx = i
+            break
+    end = actual_idx if actual_idx is not None else len(lines)
+    # Expected selector: first line in the assertion block whose body has a
+    # comment marker before the caret. The diagnostic "this location did not
+    # match" line has only whitespace before the caret and is skipped.
+    for line in lines[2:end]:
+        body_split = line.split("|", 1)
+        if len(body_split) != 2:
+            continue
+        body = body_split[1]
+        caret = body.find("^")
+        if caret < 0:
+            continue
+        prefix = body[:caret]
+        if not prefix.strip():
+            continue
+        rest = body[caret + 1:].lstrip("^").lstrip(" ").rstrip()
+        if rest:
+            out["expected_selector"] = rest
+            break
+    if actual_idx is not None:
+        for line in lines[actual_idx + 1:]:
+            body_split = line.split("|", 1)
+            if len(body_split) != 2:
+                continue
+            body = body_split[1]
+            caret_start = body.find("^")
+            if caret_start < 0:
+                continue
+            caret_end = caret_start
+            while caret_end < len(body) and body[caret_end] == "^":
+                caret_end += 1
+            col_range = body[caret_start:caret_end]
+            scope_chain = body[caret_end:].strip()
+            if scope_chain:
+                out["actual"].append({
+                    "col_range": col_range,
+                    "scope_chain": scope_chain,
+                })
+    return out
 
 
 def _is_unable_to_read(messages):
@@ -852,6 +934,7 @@ def run_inline_syntax_test(content, name):
                 "summary": "Sublime Text has not indexed the resource at %s" % resource,
                 "output": "",
                 "failures": [],
+                "failures_structured": [],
             }
         total, messages = _sublime_api.run_syntax_test(resource)
         if _is_unable_to_read(messages):
@@ -863,6 +946,7 @@ def run_inline_syntax_test(content, name):
                 "summary": "Sublime Text could not read %s after indexing wait" % resource,
                 "output": "",
                 "failures": [],
+                "failures_structured": [],
             }
         failures = list(messages)
         if failures:
@@ -871,12 +955,14 @@ def run_inline_syntax_test(content, name):
                 "summary": "FAILED: %d of %d assertions failed" % (len(failures), total),
                 "output": "\n".join(failures),
                 "failures": failures,
+                "failures_structured": [_parse_failure_message(m) for m in failures],
             }
         return {
             "state": "passed",
             "summary": "%d assertions passed" % total,
             "output": "%d assertions passed" % total,
             "failures": [],
+            "failures_structured": [],
         }
     finally:
         import shutil as _shutil
