@@ -87,6 +87,16 @@ them in `run_on_main(...)`. The following names are preloaded:
   MCP response — the same channel any other helper failure uses.
   Files outside Packages/ must be symlinked in (the helper walks
   symlinks); see SKILL.md section 4.
+- `run_inline_syntax_test(content, name) -> dict` — for synthetic
+  probes ("what does ST do on this case?"). Writes `content` to a
+  per-call temp dir under `Packages/User/`, runs ST's syntax-test
+  runner, cleans up. Same `{state, summary, output, failures}`
+  contract as `run_syntax_tests`, plus a third state
+  `"inconclusive"` when ST never indexes the temp resource within
+  the wait budget (looser than `run_syntax_tests`, which raises —
+  fresh-resource probes hit indexing latency too often for raise to
+  be the right default). The header inside `content` chooses the
+  syntax under test; the syntax must already be reachable.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -195,6 +205,18 @@ r = run_syntax_tests("/path/to/Packages/C#/tests/syntax_test_Generics.cs")
 print(r["summary"])
 for msg in r["failures"]:
     print(msg)
+```
+
+### Probe a synthetic case inline
+
+```python
+r = run_inline_syntax_test(
+    '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
+    'x = 1\n'
+    '# ^ source.python\n',
+    "syntax_test_probe",
+)
+print(r["state"], r["summary"])
 ```
 
 ### Compare a syntect baseline failure against ST
@@ -616,6 +638,107 @@ def _wait_for_resource(resource_path, timeout=3.0):
             refreshed = True
         _time.sleep(0.02)
     return False
+
+
+_TEMP_DIR_PREFIX = "__sublime_mcp_temp_"
+_TEMP_DIR_SUFFIX = "__"
+_TEMP_DIR_MAX_AGE_SECONDS = 60.0
+
+
+def _sweep_stale_temp_dirs():
+    # Cross-call defensive cleanup for run_inline_syntax_test:
+    # SIGKILL / OS panic bypass the within-call try/finally. List
+    # Packages/User entries matching the nonce scheme; remove ones
+    # older than the max-age threshold so a concurrent in-flight call
+    # isn't clobbered.
+    user_dir = _os.path.join(sublime.packages_path(), "User")
+    try:
+        entries = _os.listdir(user_dir)
+    except OSError:
+        return
+    now = _time.time()
+    for name in entries:
+        if not (name.startswith(_TEMP_DIR_PREFIX) and name.endswith(_TEMP_DIR_SUFFIX)):
+            continue
+        full = _os.path.join(user_dir, name)
+        try:
+            age = now - _os.path.getmtime(full)
+        except OSError:
+            continue
+        if age < _TEMP_DIR_MAX_AGE_SECONDS:
+            continue
+        import shutil as _shutil
+        _shutil.rmtree(full, ignore_errors=True)
+
+
+def _new_temp_dir():
+    import uuid as _uuid
+    nonce = _uuid.uuid4().hex[:12]
+    name = "%s%s%s" % (_TEMP_DIR_PREFIX, nonce, _TEMP_DIR_SUFFIX)
+    full = _os.path.join(sublime.packages_path(), "User", name)
+    _os.makedirs(full)
+    return name, full
+
+
+def run_inline_syntax_test(content, name):
+    # Write `content` to Packages/User/<nonce>/<name>, run ST's syntax-
+    # test runner against it, return the same {state, summary, output,
+    # failures} shape as run_syntax_tests. The header inside `content`
+    # (e.g. `# SYNTAX TEST "Packages/Python/Python.sublime-syntax"`)
+    # determines which syntax is exercised; the syntax must already be
+    # reachable to ST (bundled or via temp_packages_link).
+    # Two-layer cleanup: within-call try/finally for Python-visible
+    # failures, _sweep_stale_temp_dirs at the head for SIGKILL paths.
+    # Returns state="inconclusive" rather than raising on indexing
+    # miss — fresh-resource probes hit indexing latency commonly
+    # enough that a looser contract beats burning the snippet.
+    if _sublime_api is None or not hasattr(_sublime_api, "run_syntax_test"):
+        raise RuntimeError(
+            "sublime_api.run_syntax_test is unavailable on this Sublime "
+            "Text build; run_inline_syntax_test has no working fallback"
+        )
+    _sweep_stale_temp_dirs()
+    nonce_name, temp_dir = _new_temp_dir()
+    try:
+        file_path = _os.path.join(temp_dir, name)
+        with open(file_path, "w") as f:
+            f.write(content)
+        resource = "Packages/User/%s/%s" % (nonce_name, name)
+        if not _wait_for_resource(resource):
+            return {
+                "state": "inconclusive",
+                "summary": "Sublime Text has not indexed the resource at %s" % resource,
+                "output": "",
+                "failures": [],
+            }
+        total, messages = _sublime_api.run_syntax_test(resource)
+        if _is_unable_to_read(messages):
+            _wait_for_resource(resource)
+            total, messages = _sublime_api.run_syntax_test(resource)
+        if _is_unable_to_read(messages):
+            return {
+                "state": "inconclusive",
+                "summary": "Sublime Text could not read %s after indexing wait" % resource,
+                "output": "",
+                "failures": [],
+            }
+        failures = list(messages)
+        if failures:
+            return {
+                "state": "failed",
+                "summary": "FAILED: %d of %d assertions failed" % (len(failures), total),
+                "output": "\n".join(failures),
+                "failures": failures,
+            }
+        return {
+            "state": "passed",
+            "summary": "%d assertions passed" % total,
+            "output": "%d assertions passed" % total,
+            "failures": [],
+        }
+    finally:
+        import shutil as _shutil
+        _shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def run_syntax_tests(path):

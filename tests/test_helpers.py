@@ -811,3 +811,119 @@ class TestWaitForResource(HelperTestBase):
         self.assertIn("refresh_folder_list", lines[1])
         # Make sure it fired exactly once, not on every poll iteration.
         self.assertEqual(lines[1].count("refresh_folder_list"), 1)
+
+
+class TestRunInlineSyntaxTest(HelperTestBase):
+    """`run_inline_syntax_test` writes a probe file under
+    `Packages/User/__sublime_mcp_temp_<nonce>__/`, runs ST's syntax-
+    test runner, and cleans up. Mirrors `TestRunSyntaxTestsApiPath` but
+    on the inline-probe path (#30).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not cls.api_path_available:
+            raise unittest.SkipTest(
+                "sublime_api.run_syntax_test unavailable on this platform"
+            )
+
+    @classmethod
+    def _temp_dir_count(cls):
+        # Count Packages/User/__sublime_mcp_temp_*__ entries — the
+        # helper's nonce scheme. Used to assert cleanup on success and
+        # failure paths.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        try:
+            entries = os.listdir(user_dir)
+        except OSError:
+            return 0
+        return sum(
+            1
+            for e in entries
+            if e.startswith("__sublime_mcp_temp_") and e.endswith("__")
+        )
+
+    def test_passes_returns_passed_state(self):
+        before = self._temp_dir_count()
+        code = (
+            "import json\n"
+            "_ = run_inline_syntax_test(\n"
+            "    '# SYNTAX TEST \"Packages/Python/Python.sublime-syntax\"\\n'\n"
+            "    'x = 1\\n'\n"
+            "    '# ^ source.python\\n',\n"
+            "    'syntax_test_pass',\n"
+            ")\n"
+            "print(json.dumps(_))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertEqual(r["state"], "passed", r)
+        self.assertEqual(r["failures"], [])
+        self.assertEqual(self._temp_dir_count(), before)
+
+    def test_failing_assertion_populates_failures(self):
+        before = self._temp_dir_count()
+        code = (
+            "import json\n"
+            "_ = run_inline_syntax_test(\n"
+            "    '# SYNTAX TEST \"Packages/Python/Python.sublime-syntax\"\\n'\n"
+            "    'x = 1\\n'\n"
+            "    '# ^ keyword.control.flow\\n',\n"
+            "    'syntax_test_fail',\n"
+            ")\n"
+            "print(json.dumps(_))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertEqual(r["state"], "failed", r)
+        self.assertEqual(len(r["failures"]), 1, r)
+        self.assertIn("scope does not match", r["failures"][0])
+        self.assertEqual(self._temp_dir_count(), before)
+
+    def test_temp_dir_cleaned_up_on_failure(self):
+        # Force the helper to raise mid-flight by passing a non-string
+        # `name` so the os.path.join inside the try block blows up. The
+        # finally must still rmtree the temp dir.
+        before = self._temp_dir_count()
+        code = (
+            "try:\n"
+            "    run_inline_syntax_test('whatever', None)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "print('done')\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(self._temp_dir_count(), before)
+
+    def test_stale_dir_swept_on_next_call(self):
+        # Plant a stale temp dir with mtime 90 s in the past, then run
+        # a successful inline test; the sweep at the head of the call
+        # should remove the planted dir.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        stale = os.path.join(user_dir, "__sublime_mcp_temp_stale123__")
+        os.makedirs(stale, exist_ok=True)
+        self.addCleanup(shutil.rmtree, stale, ignore_errors=True)
+        old = time.time() - 90.0
+        os.utime(stale, (old, old))
+        self.assertTrue(os.path.isdir(stale))
+        code = (
+            "_ = run_inline_syntax_test(\n"
+            "    '# SYNTAX TEST \"Packages/Python/Python.sublime-syntax\"\\n'\n"
+            "    'x = 1\\n'\n"
+            "    '# ^ source.python\\n',\n"
+            "    'syntax_test_sweep',\n"
+            ")\n"
+            "print(_['state'])\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "passed")
+        self.assertFalse(os.path.exists(stale))
