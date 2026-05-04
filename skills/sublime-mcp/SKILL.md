@@ -77,13 +77,15 @@ print(r["scope"], "via", r["resolved_syntax"])
 **Landmine: extension-less syntax-test files** (`syntax_test_git_config`, no suffix) silently fall back to Plain Text via `scope_at` — `scope == "text.plain"` and `resolved_syntax == "Packages/Text/Plain text.tmLanguage"`. Use `scope_at_test` — it parses the `# SYNTAX TEST "Packages/..."` header and assigns that syntax before sampling.
 
 ```python
-print(scope_at_test("/path/to/syntax_test_git_config", 71, 28))
+r = scope_at_test("/path/to/syntax_test_git_config", 71, 28)
+print(r["scope"])
 ```
 
 The header parser is comment-token-agnostic — it accepts `#`, `//`, `<!--`, `;`, `--`, `|`, etc. Markdown's pipe-comment header works the same way:
 
 ```python
-print(scope_at_test("/path/to/syntax_test_markdown.md", 12, 4))
+r = scope_at_test("/path/to/syntax_test_markdown.md", 12, 4)
+print(r["scope"])
 ```
 
 ### Run syntax tests against a file
@@ -123,11 +125,12 @@ r = resolve_position(
     syntax_path="Packages/Java/Java.sublime-syntax",
 )
 print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
+assert r["resolved_syntax"] == r["requested_syntax"], r
 ```
 
-The returned dict also carries `overflow` (past-EOL request wrapped into a later row) and `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section.
+The returned dict also carries `overflow` (past-EOL request wrapped into a later row), `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section. `requested_syntax` echoes the `syntax_path` argument and `resolved_syntax` is `view.syntax().path` — assert they match before treating `scope` as ground truth, since `view.assign_syntax` accepts any string and silently falls through to Plain Text when the URI doesn't resolve.
 
-The symlink is the workaround for `resolve_position`'s `syntax_path` parameter; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that requires helper-managed temporary symlinks (#24). `scope_at_test` is unaffected: the file's `SYNTAX TEST` header carries the URI, conventionally `Packages/...` form already. `run_syntax_tests` is unaffected post-PR #16 (`_to_resource_path` walks symlinked entries directly). #11 (orthogonal) will echo the resolved syntax in the response, defending against symlink misresolution.
+The symlink is the workaround for `resolve_position`'s `syntax_path` parameter; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong — `requested_syntax != resolved_syntax` flags this. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that requires helper-managed temporary symlinks (#24). `scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair. `run_syntax_tests` is unaffected post-PR #16 (`_to_resource_path` walks symlinked entries directly).
 
 ### Compare a parser's output against ST
 
@@ -135,7 +138,8 @@ Three-step divergence triage:
 
 ```python
 # 1. What does ST report at the failing position?
-print(scope_at_test("/path/to/syntax_test_git_config", 71, 28))
+r = scope_at_test("/path/to/syntax_test_git_config", 71, 28)
+print(r["scope"], "via", r["resolved_syntax"])
 
 # 2. Did both engines sample the same point? (past-EOL divergence is common)
 r = resolve_position(
@@ -171,7 +175,7 @@ Measured per-call latency is tracked in #10.
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-04-28._
+_Last synced with issue state: 2026-05-03._
 
 - **#6** — bump `_wait_for_resource` timeout 1s → 2-3s for cold-disk indexing.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
@@ -179,7 +183,6 @@ _Last synced with issue state: 2026-04-28._
 - **#22** — `resolve_position` `syntax_path` accepts filesystem paths (URI flexibility only — does not eliminate the `ln -s` step in §4).
 - **#24** — helper-managed temporary symlinks for repo-local syntaxes. Lands the `ln -s`-elimination half of #9's body. Once landed, the §4 workaround paragraph (and #22 / #24 entries) become removable.
 - **#10** — documented per-call latency for bulk probes + daemon-thread / cold-tokenisation clarification.
-- **#11** — echo the resolved syntax path in `resolve_position` / `scope_at_test` responses. Defends against symlink misresolution.
 - **#30** — `run_inline_syntax_test(content, name)` lifecycle helper. Collapses the write-to-`Packages/User/`-then-poll-then-cleanup dance into one call; pairs with #24 on the on-disk side.
 - **#33** — daemon-thread `view.run_command(...)` is a silent no-op without `set_timeout`. Until the doc gotcha or `run_on_main` helper lands, callers mutating buffers from snippet code need to schedule via `set_timeout` and gate on a `threading.Event`.
 - **#34** — `find_resources` lists `Packages/...` paths whose `load_resource` raises `FileNotFoundError` (cache-survives-source case observed against `Packages/C#/Embeddings/Regex (for C#).sublime-syntax`); characterise before deciding doc vs code fix.
@@ -187,8 +190,8 @@ _Last synced with issue state: 2026-04-28._
 ## 7. Reference — preloaded helpers
 
 - `scope_at(path, row, col) -> dict` — open file, return `{"scope", "resolved_syntax"}`. `resolved_syntax` is `view.syntax().path` (or `None`); compare against the canonical plain-text URI to detect extension-less / no-syntax fallback.
-- `scope_at_test(path, row, col) -> str` — parse `# SYNTAX TEST` header, assign that syntax, return scope. Right for extension-less syntax-test files.
-- `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags.
+- `scope_at_test(path, row, col) -> dict` — parse `# SYNTAX TEST` header, assign that syntax, return `{"scope", "requested_syntax", "resolved_syntax"}`. `requested_syntax != resolved_syntax` flags silent fallback to the wrong syntax.
+- `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags; also carries `requested_syntax` / `resolved_syntax`.
 - `run_syntax_tests(path, timeout=30.0) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`.
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.

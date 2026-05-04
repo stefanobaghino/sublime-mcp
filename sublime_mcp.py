@@ -60,14 +60,19 @@ The following names are preloaded:
   (`resolved_syntax == "Packages/Text/Plain text.tmLanguage"`,
   `scope == "text.plain"`) and the caller can detect this by checking
   `resolved_syntax`.
-- `scope_at_test(path, row, col) -> str` — like `scope_at`, but
+- `scope_at_test(path, row, col) -> dict` — like `scope_at`, but
   parses the `SYNTAX TEST "Packages/..."` header on line 0 and
-  assigns that syntax to the view before sampling the scope. The
-  right helper for extension-less syntax-test files.
+  assigns that syntax to the view before sampling the scope. Returns
+  `{"scope", "resolved_syntax", "requested_syntax"}` — `requested_syntax`
+  is the URI from the header; `resolved_syntax` is what ST loaded
+  (`view.syntax().path`, or `None` if the URI doesn't resolve to a
+  real syntax). The right helper for extension-less syntax-test files.
 - `resolve_position(path, row, col, syntax_path=None) -> dict` —
   returns the full position disambiguation for `(row, col)`. See
   "text_point overflow" below. Optional `syntax_path` calls
-  `assign_syntax_and_wait` on the view first.
+  `assign_syntax_and_wait` on the view first. Response carries
+  `requested_syntax` (echo of the `syntax_path` arg, or `None`) and
+  `resolved_syntax` (ST's `view.syntax().path`, or `None`).
 - `run_syntax_tests(path, timeout=30.0) -> dict` — returns
   `{"state": str, "summary": str, "output": str, "failures": list[str]}`.
   `state` is one of `"passed"` (all assertions matched) or
@@ -158,9 +163,10 @@ print(r["scope"], "via", r["resolved_syntax"])
 ### Scope on an extension-less syntax-test file
 
 ```python
-# File has no extension; `scope_at` would return "text.plain".
+# File has no extension; `scope_at` would default to "text.plain".
 # scope_at_test parses `# SYNTAX TEST "Packages/..."` on line 0.
-print(scope_at_test("/path/to/syntax_test_git_config", 71, 28))
+r = scope_at_test("/path/to/syntax_test_git_config", 71, 28)
+print(r["scope"])
 ```
 
 ### Resolve a past-EOL position
@@ -191,7 +197,12 @@ semantics divergence?". Each step answers a distinct question:
 
 ```python
 # 1. What scope does ST actually report at the failing position?
-print(scope_at_test("/path/to/Packages/Git Formats/tests/syntax_test_git_config", 71, 28))
+#    Compare requested_syntax vs resolved_syntax to detect silent
+#    fallback (e.g. ST loaded a built-in version of a syntax that the
+#    test was authored against).
+r = scope_at_test("/path/to/Packages/Git Formats/tests/syntax_test_git_config", 71, 28)
+print(r["scope"], "via", r["resolved_syntax"])
+assert r["resolved_syntax"] == r["requested_syntax"], r
 
 # 2. Did syntect and ST even agree on which row/col to sample?
 #    (past-EOL overflow is a common hidden source of divergence)
@@ -200,6 +211,7 @@ r = resolve_position(
     syntax_path="Packages/Git Formats/Git Config.sublime-syntax",
 )
 print("overflow:", r["overflow"], "clamped:", r["clamped"], "actual:", r["actual"])
+print("resolved:", r["resolved_syntax"])
 
 # 3. What does ST's own assertion runner say about this file?
 #    If ST cannot complete the run, run_syntax_tests raises and the
@@ -382,7 +394,12 @@ def scope_at_test(path, row, col):
     resource_path = _parse_syntax_test_header(view)
     assign_syntax_and_wait(view, resource_path)
     point = view.text_point(row, col)
-    return view.scope_name(point).rstrip()
+    syntax = view.syntax()
+    return {
+        "scope": view.scope_name(point).rstrip(),
+        "requested_syntax": resource_path,
+        "resolved_syntax": syntax.path if syntax is not None else None,
+    }
 
 
 def resolve_position(path, row, col, syntax_path=None):
@@ -398,6 +415,7 @@ def resolve_position(path, row, col, syntax_path=None):
     # against future inputs that resolve to a *smaller* row (negative
     # rows, CRLF edge cases) — those would be bugs, not overflows.
     overflow = real_row > row and not clamped
+    syntax = view.syntax()
     return {
         "point": point,
         "requested": [row, col],
@@ -405,6 +423,8 @@ def resolve_position(path, row, col, syntax_path=None):
         "scope": view.scope_name(point).rstrip(),
         "overflow": overflow,
         "clamped": clamped,
+        "requested_syntax": syntax_path,
+        "resolved_syntax": syntax.path if syntax is not None else None,
     }
 
 

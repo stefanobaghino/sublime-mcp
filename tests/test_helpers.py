@@ -224,12 +224,22 @@ class TestScopeAtExtensionless(HelperTestBase):
         self.assertEqual(r["resolved_syntax"], "Packages/Text/Plain text.tmLanguage")
 
     def test_scope_at_test_parses_header_and_returns_real_scope(self):
-        resp = yield from _call_tool_yielding(
-            "print(scope_at_test(%r, 1, 0))" % self.fixture_path
+        code = (
+            "import json\n"
+            "_ = scope_at_test(%r, 1, 0)\n"
+            "print(json.dumps(_))\n" % self.fixture_path
         )
+        resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
-        self.assertIn("source.python", outcome["output"])
+        r = json.loads(outcome["output"])
+        self.assertIn("source.python", r["scope"])
+        self.assertEqual(
+            r["requested_syntax"], "Packages/Python/Python.sublime-syntax"
+        )
+        # Header-requested syntax matches what ST loaded → silent-fallback
+        # signal is clean.
+        self.assertEqual(r["resolved_syntax"], r["requested_syntax"])
 
 
 class TestScopeAtTestNoHeader(HelperTestBase):
@@ -280,6 +290,12 @@ class TestResolvePosition(HelperTestBase):
         self.assertFalse(r["clamped"])
         self.assertEqual(r["actual"], [1, 2])
         self.assertEqual(r["requested"], [1, 2])
+        # `_resolve` always passes `syntax_path`, so both fields are populated
+        # and equal on the happy path.
+        self.assertEqual(
+            r["requested_syntax"], "Packages/Python/Python.sublime-syntax"
+        )
+        self.assertEqual(r["resolved_syntax"], r["requested_syntax"])
 
     def test_past_eol_overflows_into_next_row(self):
         # Row 1 is 5 chars + \n; col 10 lands in a later row.
@@ -298,6 +314,33 @@ class TestResolvePosition(HelperTestBase):
         )
         size = int(_outcome(size_resp)["output"].strip())
         self.assertEqual(r["point"], size)
+
+    def test_no_syntax_path_arg_leaves_requested_syntax_none(self):
+        code = (
+            "import json\n"
+            "_ = resolve_position(%r, 1, 0)\n"
+            "print(json.dumps(_))\n" % self.fixture_path
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        # No `syntax_path` provided → requested_syntax is None; resolved_syntax
+        # reflects whatever ST inferred from the file (or extension).
+        self.assertIsNone(r["requested_syntax"])
+        self.assertIsNotNone(r["resolved_syntax"])
+
+    # The wrong-syntax silent-fallback case (bogus `syntax_path` URI →
+    # `view.syntax()` returns None while `view.settings().get("syntax")`
+    # echoes the bogus URI verbatim) is the canonical #11 failure mode.
+    # Locally observable, but a probe with `Packages/__nonexistent__/...`
+    # provoked a deferred main-thread side-effect on macOS-CI that
+    # throttled every subsequent test until the suite hit the
+    # SublimeText/UnitTesting watchdog. Coverage gap is intentional:
+    # `test_in_bounds_no_flags_set` already asserts that both fields are
+    # populated and equal on the happy path, which guards the
+    # field-presence regression. A dedicated wrong-syntax test that
+    # avoids the macOS side-effect will need a different trigger.
 
 
 class TestRunSyntaxTestsApiPath(HelperTestBase):
@@ -508,12 +551,16 @@ class TestScopeAtTestPipeHeader(HelperTestBase):
         )
 
     def test_pipe_comment_header_parses(self):
-        resp = yield from _call_tool_yielding(
-            "print(scope_at_test(%r, 1, 0))" % self.fixture_path
+        code = (
+            "import json\n"
+            "_ = scope_at_test(%r, 1, 0)\n"
+            "print(json.dumps(_))\n" % self.fixture_path
         )
+        resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
-        self.assertIn("text.html.markdown", outcome["output"])
+        r = json.loads(outcome["output"])
+        self.assertIn("text.html.markdown", r["scope"])
 
 
 class TestScopeAtTestHtmlComment(HelperTestBase):
@@ -529,16 +576,20 @@ class TestScopeAtTestHtmlComment(HelperTestBase):
         )
 
     def test_html_comment_header_parses(self):
-        resp = yield from _call_tool_yielding(
-            "print(scope_at_test(%r, 1, 0))" % self.fixture_path
+        code = (
+            "import json\n"
+            "_ = scope_at_test(%r, 1, 0)\n"
+            "print(json.dumps(_))\n" % self.fixture_path
         )
+        resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
         # `text.html.basic` rather than `text.html`: the looser prefix
         # would also match `text.html.markdown`, so a regression that
         # mis-applied Markdown syntax to the HTML fixture would slip
         # through.
-        self.assertIn("text.html.basic", outcome["output"])
+        self.assertIn("text.html.basic", r["scope"])
 
 
 class TestHeadlessGuard(HelperTestBase):
