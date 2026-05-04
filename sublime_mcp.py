@@ -13,6 +13,7 @@ import ast
 import builtins as _builtins
 import io
 import json
+import os
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -21,8 +22,13 @@ import sublime
 import sublime_plugin  # noqa: F401  (exposed to exec'd snippets)
 
 
-HOST = "127.0.0.1"
-PORT = 47823
+# `HOST` defaults to loopback so a host install is unreachable off-box.
+# The Docker harness sets `SUBLIME_MCP_HOST=0.0.0.0` so its userland
+# port-forwarder can reach the bind from outside the container's
+# network namespace; the harness's `-p 127.0.0.1:0:47823` keeps the
+# resulting host port loopback-only.
+HOST = os.environ.get("SUBLIME_MCP_HOST", "127.0.0.1")
+PORT = int(os.environ.get("SUBLIME_MCP_PORT", "47823"))
 ENDPOINT = "/mcp"
 
 EXEC_TIMEOUT_SECONDS = 60.0
