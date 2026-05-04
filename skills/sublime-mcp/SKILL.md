@@ -129,14 +129,15 @@ Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one 
 
 `view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
 
-For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. The caller builds URIs against it and tears down via `release_packages_link`.
+For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. Pass the syntax's filesystem path directly to `resolve_position` / `assign_syntax_and_wait` — the helpers reverse-map filesystem inputs through any symlink in `sublime.packages_path()` to the matching `Packages/...` URI. (Constructing the URI by hand as `"Packages/%s/Java.sublime-syntax" % name` still works.) The caller tears down via `release_packages_link`.
 
 ```python
-name = temp_packages_link("/path/to/repo/testdata/Packages/Java/Java.sublime-syntax")
+syntax_path = "/path/to/repo/testdata/Packages/Java/Java.sublime-syntax"
+name = temp_packages_link(syntax_path)
 try:
     r = resolve_position(
         "/path/to/syntax_test_file", row=71, col=29,
-        syntax_path="Packages/%s/Java.sublime-syntax" % name,
+        syntax_path=syntax_path,
     )
     print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
     assert r["resolved_syntax"] == r["requested_syntax"], r
@@ -241,7 +242,6 @@ _Last synced with issue state: 2026-05-04._
 
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
-- **#22** — `resolve_position` `syntax_path` accepts filesystem paths directly (URI flexibility on top of `temp_packages_link`).
 - **whole-tree mirror** (follow-up to #24) — `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.
 - **#34** — `find_resources` can list stale `Packages/...` paths whose `load_resource` raises `FileNotFoundError`; documented in §4 ("Filter find_resources output through load_resource").
 

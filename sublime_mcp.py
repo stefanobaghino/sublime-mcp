@@ -70,9 +70,14 @@ them in `run_on_main(...)`. The following names are preloaded:
 - `resolve_position(path, row, col, syntax_path=None) -> dict` —
   returns the full position disambiguation for `(row, col)`. See
   "text_point overflow" below. Optional `syntax_path` calls
-  `assign_syntax_and_wait` on the view first. Response carries
-  `requested_syntax` (echo of the `syntax_path` arg, or `None`) and
-  `resolved_syntax` (ST's `view.syntax().path`, or `None`).
+  `assign_syntax_and_wait` on the view first; accepts either a
+  `Packages/...` URI or a filesystem path under `sublime.packages_path()`
+  (directly or via a symlink in that directory). Response carries
+  `requested_syntax` (the `Packages/...` URI ST was asked for —
+  filesystem-form inputs are normalised to URI form so the equality
+  check below still works; `None` when `syntax_path` was omitted) and
+  `resolved_syntax` (ST's `view.syntax().path`, or `None`). Compare the
+  two for silent-fallback detection.
 - `run_syntax_tests(path) -> dict` — returns
   `{"state": str, "summary": str, "output": str,
     "failures": list[str], "failures_structured": list[dict]}`.
@@ -119,7 +124,10 @@ them in `run_on_main(...)`. The following names are preloaded:
   `is_loading()` up to 5 s, returns the View.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None`
   — assigns a syntax and best-effort waits for tokenisation to touch
-  point 0. Stage 1 (wait for the syntax setting to apply) is
+  point 0. `resource_path` accepts either a `Packages/...` URI or a
+  filesystem path under `sublime.packages_path()` (directly or via a
+  symlink in that directory); paths outside that tree raise
+  `ValueError`. Stage 1 (wait for the syntax setting to apply) is
   deterministic; stage 2 (tokenisation) is best-effort — ST has no
   public tokenisation-complete signal. For large files, re-read
   `scope_name` after use rather than trusting the helper.
@@ -480,6 +488,21 @@ def assign_syntax_and_wait(view, resource_path, timeout=2.0):
     # views from a headless ST (no window) — so `view.size() > 0` need
     # not be re-asserted here. A direct caller bypassing `open_view` on
     # a zero-size view will time out on stage 1 below.
+    # `view.assign_syntax` requires a `Packages/...` URI; route a
+    # filesystem-form input through `_to_resource_path` (passthrough
+    # for inputs already in `Packages/...` form). Reachable inputs
+    # outside the Packages tree are the caller's bug — surface them
+    # rather than silently passing through to ST and falling back to
+    # text.plain (the failure shape #11 hardened scope_at against).
+    converted = _to_resource_path(resource_path)
+    if converted is None:
+        raise ValueError(
+            "assign_syntax_and_wait: %r is not under sublime.packages_path() "
+            "(directly or via a symlink in that directory). Use "
+            "temp_packages_link to make a repo-local syntax reachable first."
+            % resource_path
+        )
+    resource_path = converted
     # ST exposes no public tokenisation-complete signal. Stage 1 waits for
     # view.settings()["syntax"] to reflect the requested path (usually one
     # tick, but guards against a typo landing silently). Stage 2 is a
@@ -540,6 +563,21 @@ def scope_at_test(path, row, col):
 def resolve_position(path, row, col, syntax_path=None):
     view = open_view(path)
     if syntax_path is not None:
+        # Convert here too (not just inside assign_syntax_and_wait) so
+        # `requested_syntax` echoes the URI ST actually saw. Otherwise a
+        # filesystem-form input breaks the `resolved_syntax == requested_syntax`
+        # equality contract that callers use for silent-fallback detection (#11).
+        # The repeat call inside assign_syntax_and_wait is a passthrough on the
+        # already-resource-form URI.
+        converted = _to_resource_path(syntax_path)
+        if converted is None:
+            raise ValueError(
+                "resolve_position: %r is not under sublime.packages_path() "
+                "(directly or via a symlink in that directory). Use "
+                "temp_packages_link to make a repo-local syntax reachable first."
+                % syntax_path
+            )
+        syntax_path = converted
         assign_syntax_and_wait(view, syntax_path)
     point = view.text_point(row, col)
     real_row, real_col = view.rowcol(point)
