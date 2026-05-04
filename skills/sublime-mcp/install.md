@@ -83,18 +83,18 @@ macOS paths shown — adjust for Linux's `~/.config/sublime-text/Packages/` or y
 ln -s /path/to/your/Packages/Markdown \
       ~/Library/Application\ Support/Sublime\ Text/Packages/__sublime_mcp_verify__
 
-# Step 2. Call run_syntax_tests with the *target path* — the input form
-# that triggered <no build panel found> on pre-fix code. The symlink-
-# walk now reverse-maps it to Packages/__sublime_mcp_verify__/...
+# Step 2. Call run_syntax_tests with the *target path* (outside the
+# Packages tree); the symlink-walk reverse-maps it to
+# Packages/__sublime_mcp_verify__/...
 curl -s -X POST http://127.0.0.1:47823/mcp \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_sublime_python","arguments":{"code":"r = run_syntax_tests(\"/path/to/your/Packages/Markdown/tests/syntax_test_markdown.md\"); print(r[\"summary\"])"}}}'
 # Success: `summary` is a numeric "N assertions passed" or
-# "FAILED: M of N assertions failed". Explicitly NOT
-# "<no build panel found>" (the API path didn't fire — _to_resource_path
-# returned None) and NOT "<resource not indexed by Sublime Text>" (the
-# API path ran but ST's resource indexer disagreed with the
-# reconstructed URI).
+# "FAILED: M of N assertions failed". Explicitly NOT a top-level
+# `error` carrying "is not under sublime.packages_path()" (the
+# symlink-walk failed to reverse-map) or "Sublime Text has not
+# indexed the resource" (mapped, but ST's resource indexer disagreed
+# with the reconstructed URI).
 
 # Step 3. Cleanup (do not skip). unlink, NOT rm -r / rm -rf — those
 # follow the symlink and would delete the target's contents.

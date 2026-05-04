@@ -105,7 +105,7 @@ Branch on `state` for the assertion-run outcome:
 | `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]`           |
 | `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated      |
 
-When ST cannot complete the run, `run_syntax_tests` raises and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. Type split: `TimeoutError` for the no-output-before-deadline case; `RuntimeError` for build-panel missing (tracked as #17), unindexed resources, and unparsable build-panel output. Fall back to the "Scope at a position" recipe (`scope_at` / `scope_at_test`) or "Confirm which syntax ST assigned (and handle repo-local syntaxes)" (`resolve_position`) — these answer the underlying ground-truth question without going through ST's build path.
+When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. The reachable causes are: resource not yet indexed, path outside `sublime.packages_path()` (symlink it in first — see "Confirm which syntax ST assigned (and handle repo-local syntaxes)" below), and the private `sublime_api.run_syntax_test` missing on this ST build. For ground-truth questions that don't need the assertion runner, fall back to `scope_at` / `scope_at_test` or `resolve_position`.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
@@ -131,7 +131,7 @@ assert r["resolved_syntax"] == r["requested_syntax"], r
 
 The returned dict also carries `overflow` (past-EOL request wrapped into a later row), `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section. `requested_syntax` echoes the `syntax_path` argument and `resolved_syntax` is `view.syntax().path` — assert they match before treating `scope` as ground truth, since `view.assign_syntax` accepts any string and silently falls through to Plain Text when the URI doesn't resolve.
 
-The symlink is the workaround for `resolve_position`'s `syntax_path` parameter; beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong — `requested_syntax != resolved_syntax` flags this. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that requires helper-managed temporary symlinks (#24). `scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair. `run_syntax_tests` is unaffected post-PR #16 (`_to_resource_path` walks symlinked entries directly).
+The symlink is the workaround for `resolve_position`'s `syntax_path` parameter and for `run_syntax_tests` (paths outside the Packages tree raise — there is no fallback, see #51); beware that ST might resolve to a same-named bundled syntax if the symlink ordering is wrong — `requested_syntax != resolved_syntax` flags this. #22 will let `resolve_position` accept filesystem paths instead of `Packages/...` URIs, but the `ln -s` step itself stays load-bearing — eliminating that requires helper-managed temporary symlinks (#24). `scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair.
 
 ### Compare a parser's output against ST
 
@@ -193,7 +193,7 @@ _Last synced with issue state: 2026-05-03._
 - `scope_at(path, row, col) -> dict` — open file, return `{"scope", "resolved_syntax"}`. `resolved_syntax` is `view.syntax().path` (or `None`); compare against the canonical plain-text URI to detect extension-less / no-syntax fallback.
 - `scope_at_test(path, row, col) -> dict` — parse `# SYNTAX TEST` header, assign that syntax, return `{"scope", "requested_syntax", "resolved_syntax"}`. `requested_syntax != resolved_syntax` flags silent fallback to the wrong syntax.
 - `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags; also carries `requested_syntax` / `resolved_syntax`.
-- `run_syntax_tests(path, timeout=30.0) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`.
+- `run_syntax_tests(path) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures}`. Path must resolve under `sublime.packages_path()` (directly or via a symlink in that directory); paths outside the Packages tree raise.
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
