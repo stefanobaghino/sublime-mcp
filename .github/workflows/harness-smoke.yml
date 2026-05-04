@@ -1,0 +1,23 @@
+name: harness-smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  harness-smoke-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Pre-build the image
+        # Done as a separate step so build time is visible in CI logs
+        # and the test step only measures container boot + readiness.
+        run: docker build -t sublime-mcp-harness:latest .
+      - name: Run harness smoke test
+        run: python3 tests/test_harness_smoke.py
