@@ -729,43 +729,33 @@ def _parse_syntax_test_header(view):
     return m.group(1)
 
 
-_PLAIN_TEXT_URI = "Packages/Text/Plain text.tmLanguage"
-
-
-def _read_syntax_and_scope(view, point, retry_wait_s=1.0):
-    # Producer-side retry to absorb the post-assign race documented at #70.
-    # Two observed shapes after `assign_syntax_and_wait` returns:
-    #   (a) `view.syntax()` is None while `view.scope_name(point)` already
-    #       returns a non-plain scope chain — the strict
-    #       `resolved == requested` assertion in SKILL.md §4 spuriously
-    #       fails, callers discard a good answer.
-    #   (b) `view.syntax()` is the requested syntax while
-    #       `view.scope_name(point)` still returns "text.plain" —
-    #       worse, the strict assertion spuriously passes and callers
-    #       treat plain text as ground truth.
-    # When the first reads agree on "real syntax / real scope" or both
-    # agree on "plain", return immediately. Otherwise wait once for
-    # `retry_wait_s` and re-read. Single retry rather than tight
-    # polling: worker → main IPC chatter on `view.syntax()` /
-    # `view.scope_name(...)` contends with ST's main-thread tokeniser
-    # under load (observed on the run-tests CI gate when polling at 50
-    # Hz across N race-prone calls). 1 s matches the latching latency
-    # observed on Linux CI; persistent disagreement past that returns
-    # the last reads — same envelope shape callers see today, and the
-    # residual is the silent-parse-table-build-failure signal #78 will
-    # own.
+def _resolved_syntax_with_op_race_mitigation(view, requested_path):
+    # `view.syntax()` lags `assign_syntax(...)` by tens of ms to ~1 s on
+    # observed traces (#70, OP direction): `view.scope_name(point)` already
+    # returns the latched scope chain while `view.syntax()` still returns
+    # `None`, so the `resolved_syntax == requested_syntax` assertion in
+    # SKILL.md §4 spuriously fails and callers discard correct answers.
+    #
+    # `view.settings()["syntax"]` latches synchronously when ST accepts
+    # `assign_syntax(URI)` — `assign_syntax_and_wait`'s stage 1 polls until
+    # this matches the requested URI before returning, so by the time we
+    # reach this read it is the requested URI. Substitute it as a
+    # producer-side proxy for the `view.syntax()` accessor when the latter
+    # has not caught up. Single read, no sleep, no polling: a previous
+    # poll-loop / single-retry shape that called `view.syntax()` repeatedly
+    # wedged macOS run-tests for unclear reasons.
+    #
+    # Symmetric race (`view.syntax()` returns the assigned syntax while
+    # `view.scope_name(point)` still returns `"text.plain"`) is not
+    # addressed by this approach — that one needs a tokenisation wait that
+    # we don't have a non-wedging shape for yet.
     syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
-    scope = view.scope_name(point).rstrip()
-    syntax_looks_real = resolved is not None and resolved != _PLAIN_TEXT_URI
-    scope_looks_real = bool(scope) and scope != "text.plain"
-    if syntax_looks_real == scope_looks_real:
-        return resolved, scope
-    _time.sleep(retry_wait_s)
-    syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
-    scope = view.scope_name(point).rstrip()
-    return resolved, scope
+    if syntax is not None:
+        return syntax.path
+    settings_syntax = view.settings().get("syntax")
+    if settings_syntax and settings_syntax == requested_path:
+        return settings_syntax
+    return None
 
 
 def scope_at_test(path, row, col):
@@ -773,10 +763,7 @@ def scope_at_test(path, row, col):
     resource_path = _parse_syntax_test_header(view)
     assign_syntax_and_wait(view, resource_path)
     point = view.text_point(row, col)
-    # DIAGNOSTIC: temporarily reverted to inline reads to confirm the
-    # macOS run-tests hang is or is not caused by `_read_syntax_and_scope`.
-    syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
+    resolved = _resolved_syntax_with_op_race_mitigation(view, resource_path)
     scope = view.scope_name(point).rstrip()
     if resolved != resource_path:
         _log.warning(
@@ -819,10 +806,11 @@ def resolve_position(path, row, col, syntax_path=None):
     # against future inputs that resolve to a *smaller* row (negative
     # rows, CRLF edge cases) — those would be bugs, not overflows.
     overflow = real_row > row and not clamped
-    # DIAGNOSTIC: temporarily reverted to inline reads to confirm the
-    # macOS run-tests hang is or is not caused by `_read_syntax_and_scope`.
-    syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
+    if syntax_path is not None:
+        resolved = _resolved_syntax_with_op_race_mitigation(view, syntax_path)
+    else:
+        syntax = view.syntax()
+        resolved = syntax.path if syntax is not None else None
     scope = view.scope_name(point).rstrip()
     if syntax_path is not None and resolved != syntax_path:
         _log.warning(
