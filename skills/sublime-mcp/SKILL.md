@@ -123,6 +123,8 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
+The helpers split into two families. **View-driving** helpers (`scope_at`, `scope_at_test`, `resolve_position`, `open_view`, `assign_syntax_and_wait`) require a window — they raise `RuntimeError` in headless ST. **Runner-driving** helpers (`run_syntax_tests`, `run_inline_syntax_test`) and resource queries (`find_resources`, `wait_for_resource`, `reload_syntax`, `temp_packages_link` / `release_packages_link`) work fine headless. When `len(sublime.windows()) == 0`, runner-driving experiments still proceed; only view-driving snippets need the user to open a window first (`open -a "Sublime Text"` on macOS).
+
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
 **Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. If the call hangs or times out instead of raising, the host-side-write footgun is the likely cause — same root, different shape; see §4. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
@@ -190,6 +192,27 @@ When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and th
 
 The `^` alignment rule that defines what each assertion line targets is documented under *Probe a synthetic case inline* below.
 
+### Read the scope chain via the runner's failure diagnostic
+
+When ST is headless (no window), `scope_at` / `scope_at_test` / `resolve_position` raise `RuntimeError`. The runner-driven equivalent: author a syntax test asserting against a guaranteed-failing selector at the position of interest; the runner's failure diagnostic carries the live scope chain at every column the assertion covers.
+
+```python
+r = run_inline_syntax_test(
+    '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
+    'def foo(): pass\n'
+    '#^^^ probe.scope.never\n',
+    "syntax_test_scope_probe",
+)
+chain = r["failures_structured"][0]["actual"][0]["scope_chain"]
+# -> "source.python meta.function.python keyword.declaration.function.python …"
+```
+
+Each `^` on the assertion line tests the column it sits in on the content line directly above — see *Probe a synthetic case inline* below for the alignment rule. `failures_structured[i].actual[j]` is `{col_range, scope_chain}`; the chain is ST's full hierarchical scope at that column, identical to what `scope_at` would return windowed (modulo trailing whitespace, which the parser preserves verbatim).
+
+When the syntax under test is also synthetic, pair this with `temp_packages_link` exactly as the *Probe a synthetic syntax against a synthetic input* recipe below does — the runner reads through the link the same way `resolve_position` does.
+
+Use this when ST is headless, or when `assign_syntax_and_wait` is racing the indexer (the runner doesn't go through `assign_syntax`); prefer `scope_at` / `scope_at_test` / `resolve_position` when a window is available — they accept any column directly without `^`-alignment constraints.
+
 ### Probe a synthetic case inline
 
 For "what does ST do on this case?" probes against a syntax that's *already reachable to ST* — bundled, or linked into `Packages/` via `temp_packages_link` — `run_inline_syntax_test(content, name)` owns the file-write, indexing wait, runner call, and cleanup. The header inside `content` selects the syntax under test.
@@ -234,7 +257,7 @@ _ = chains
 
 For iterating one-rule variants of the same syntax, overwrite `Foo.sublime-syntax` under the link between sweeps and call `reload_syntax(syntax_uri)` to force ST to reparse — cheaper than tearing down and re-linking.
 
-When ST is headless (no window), `resolve_position` and the `scope_at` family raise — see #66 for the runner-driven scope-chain extraction recipe.
+When ST is headless, `resolve_position` raises — use the *Read the scope chain via the runner's failure diagnostic* recipe above to sweep scopes against synthetic syntaxes without a window. Pair it with the same `temp_packages_link` setup this recipe uses; the runner reads through the link the same way `resolve_position` does.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
