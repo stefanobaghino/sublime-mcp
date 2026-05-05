@@ -260,6 +260,8 @@ The returned dict also carries `overflow` (past-EOL request wrapped into a later
 
 `temp_packages_link` synthesises a unique nonce-named package, so the bundled `Packages/Java` continues to load alongside it — `requested_syntax != resolved_syntax` still flags any silent fallback to a built-in. The per-syntax mode is sufficient for synthetic probes and single-grammar regression triage; cross-grammar investigations where the testdata grammar embeds another testdata grammar (e.g. C# embedding RegExp) need a whole-tree mirror that shadows the built-ins, tracked separately in §6.
 
+When a caller writes additional `.sublime-syntax` files into the already-linked dir between snippets — incremental probing — wait for them to surface via `wait_for_resource("MyProbe*.sublime-syntax")` from a follow-up snippet, *not* an in-snippet `find_resources` poll. An in-snippet poll that overruns `EXEC_TIMEOUT_SECONDS` is killed at the transport, but the main-thread state it touched can leave ST wedged for the rest of the session (#64).
+
 `scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair without needing a symlink. `run_syntax_tests` accepts any path under `sublime.packages_path()` (directly or via symlink); pair it with `temp_packages_link` to cover paths outside the Packages tree.
 
 ### Compare a parser's output against ST
@@ -369,6 +371,7 @@ _Last synced with issue state: 2026-05-05._
 - `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
 - `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
+- `wait_for_resource(pattern, timeout=3.0) -> bool` — poll `find_resources(pattern)` until any match surfaces or the budget expires. Use across snippets to wait for a file written in a prior `exec_sublime_python` to surface in ST's resource index — chaining cross-snippet avoids the wedge risk of in-snippet polling that overruns `EXEC_TIMEOUT_SECONDS`.
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
 
 Full signatures, gotchas, and threading guarantees live in `TOOL_DESCRIPTION` (read via `tools/list`). This reference is a cheat-sheet.

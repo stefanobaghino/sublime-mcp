@@ -991,6 +991,87 @@ class TestWaitForResource(HelperTestBase):
         self.assertEqual(lines[1].count("refresh_folder_list"), 1)
 
 
+class TestWaitForResourcePublic(HelperTestBase):
+    """`wait_for_resource(pattern, timeout=3.0)` is the public glob-
+    pattern counterpart to the private `_wait_for_resource(path, …)`
+    used internally by `temp_packages_link`. Returns True when any
+    resource matching the pattern surfaces within the budget, False
+    otherwise — exposed so callers can chain indexing waits across
+    snippets instead of polling inside one (#64).
+    """
+
+    def test_default_timeout_is_three_seconds(self):
+        # The default is the externally-visible contract; anchor it
+        # via inspect.signature to mirror the _wait_for_resource test.
+        code = (
+            "import inspect\n"
+            "_ = inspect.signature(wait_for_resource).parameters['timeout'].default\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "3.0")
+
+    def test_returns_true_for_existing_resource(self):
+        # `find_resources` matches basename globs against ST's resource
+        # index. `Python.sublime-syntax` is bundled with ST 4 and
+        # present from startup, so the helper should return True well
+        # within the default budget.
+        code = (
+            "found = wait_for_resource('Python.sublime-syntax')\n"
+            "print(found)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "True")
+
+    def test_returns_false_when_pattern_misses(self):
+        # Tight budget so the test runs in well under a second; the
+        # pattern is constructed to never match anything in ST's index.
+        code = (
+            "import time\n"
+            "t0 = time.time()\n"
+            "found = wait_for_resource('__sublime_mcp_nonexistent__.sublime-syntax', timeout=0.1)\n"
+            "elapsed = time.time() - t0\n"
+            "print(found)\n"
+            "print(elapsed < 0.5)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "False")
+        self.assertEqual(lines[1], "True")
+
+    def test_refresh_folder_list_fires_after_two_thirds(self):
+        # Mirror the _wait_for_resource refresh-nudge test. Patch
+        # sublime.run_command so the test doesn't actually nudge ST's
+        # indexer. 0.3 s budget → refresh at ~0.2 s → ~0.1 s of post-
+        # refresh polling before the deadline. set_timeout dispatch
+        # is async; sleep within the patch context after the wait
+        # returns so the lambda has time to land on main.
+        code = (
+            "import time\n"
+            "import unittest.mock\n"
+            "calls = []\n"
+            "with unittest.mock.patch.object(sublime, 'run_command', new=lambda *a, **k: calls.append(a)):\n"
+            "    found = wait_for_resource('__sublime_mcp_nonexistent__.sublime-syntax', timeout=0.3)\n"
+            "    time.sleep(0.3)\n"
+            "print(found)\n"
+            "print(calls)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "False")
+        self.assertIn("refresh_folder_list", lines[1])
+        # Make sure it fired exactly once, not on every poll iteration.
+        self.assertEqual(lines[1].count("refresh_folder_list"), 1)
+
+
 class TestRunInlineSyntaxTest(HelperTestBase):
     """`run_inline_syntax_test` writes a probe file under
     `Packages/User/__sublime_mcp_temp_<nonce>__/`, runs ST's syntax-

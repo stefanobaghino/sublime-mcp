@@ -1048,6 +1048,35 @@ def _wait_for_resource(resource_path, timeout=3.0):
     return False
 
 
+def wait_for_resource(pattern, timeout=3.0):
+    # Public counterpart to _wait_for_resource. Returns True if any
+    # resource matching the glob pattern surfaces within the budget,
+    # False otherwise. Use this from snippet callers that have just
+    # written a file into Packages/User/ (or under an existing
+    # temp_packages_link) and need to wait for ST's resource indexer
+    # to surface it before sampling.
+    #
+    # Prefer chaining this across snippets — write the file in one
+    # exec, poll in a second — over polling inside the same snippet.
+    # An in-snippet poll that exceeds EXEC_TIMEOUT_SECONDS is killed
+    # at the transport, but the main-thread work it triggered can
+    # leave ST wedged for the rest of the session (#64).
+    start = _time.time()
+    deadline = start + timeout
+    refresh_threshold = start + (timeout * 2.0 / 3.0)
+    refreshed = False
+    while _time.time() < deadline:
+        if find_resources(pattern):
+            return True
+        if not refreshed and _time.time() >= refresh_threshold:
+            sublime.set_timeout(
+                lambda: sublime.run_command("refresh_folder_list"), 0
+            )
+            refreshed = True
+        _time.sleep(0.02)
+    return False
+
+
 _TEMP_DIR_PREFIX = "__sublime_mcp_temp_"
 _TEMP_DIR_SUFFIX = "__"
 _TEMP_DIR_MAX_AGE_SECONDS = 60.0
