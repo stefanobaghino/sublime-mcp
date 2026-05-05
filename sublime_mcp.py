@@ -732,7 +732,7 @@ def _parse_syntax_test_header(view):
 _PLAIN_TEXT_URI = "Packages/Text/Plain text.tmLanguage"
 
 
-def _read_syntax_and_scope(view, point, deadline_s=1.0):
+def _read_syntax_and_scope(view, point, retry_wait_s=1.0):
     # Producer-side retry to absorb the post-assign race documented at #70.
     # Two observed shapes after `assign_syntax_and_wait` returns:
     #   (a) `view.syntax()` is None while `view.scope_name(point)` already
@@ -743,27 +743,29 @@ def _read_syntax_and_scope(view, point, deadline_s=1.0):
     #       `view.scope_name(point)` still returns "text.plain" —
     #       worse, the strict assertion spuriously passes and callers
     #       treat plain text as ground truth.
-    # We converge by retrying until both reads agree on "real syntax /
-    # real scope" or both agree on "plain", whichever way they latch.
-    # Persistent disagreement past `deadline_s` returns the last reads —
-    # the caller gets the same envelope shape it always got, and the
+    # When the first reads agree on "real syntax / real scope" or both
+    # agree on "plain", return immediately. Otherwise wait once for
+    # `retry_wait_s` and re-read. Single retry rather than tight
+    # polling: worker → main IPC chatter on `view.syntax()` /
+    # `view.scope_name(...)` contends with ST's main-thread tokeniser
+    # under load (observed on the run-tests CI gate when polling at 50
+    # Hz across N race-prone calls). 1 s matches the latching latency
+    # observed on Linux CI; persistent disagreement past that returns
+    # the last reads — same envelope shape callers see today, and the
     # residual is the silent-parse-table-build-failure signal #78 will
-    # own. Budget sized to 1.0 s: the OP-direction race (`view.syntax()`
-    # lagging) was observed to take noticeably longer than tokenisation
-    # on Linux CI; matches `assign_syntax_and_wait`'s 2 s stage-1 ceiling
-    # for the same producer-side latching while keeping the helper from
-    # extending a `resolve_position` call beyond half that on the slow
-    # path.
-    deadline = _time.time() + deadline_s
-    while True:
-        syntax = view.syntax()
-        resolved = syntax.path if syntax is not None else None
-        scope = view.scope_name(point).rstrip()
-        syntax_looks_real = resolved is not None and resolved != _PLAIN_TEXT_URI
-        scope_looks_real = bool(scope) and scope != "text.plain"
-        if syntax_looks_real == scope_looks_real or _time.time() >= deadline:
-            return resolved, scope
-        _time.sleep(0.02)
+    # own.
+    syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    scope = view.scope_name(point).rstrip()
+    syntax_looks_real = resolved is not None and resolved != _PLAIN_TEXT_URI
+    scope_looks_real = bool(scope) and scope != "text.plain"
+    if syntax_looks_real == scope_looks_real:
+        return resolved, scope
+    _time.sleep(retry_wait_s)
+    syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    scope = view.scope_name(point).rstrip()
+    return resolved, scope
 
 
 def scope_at_test(path, row, col):
