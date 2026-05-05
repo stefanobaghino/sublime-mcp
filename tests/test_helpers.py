@@ -1684,6 +1684,14 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
         self.assertIn("temp_packages_link", outcome["error"])
 
 
+@unittest.skipIf(
+    sys.platform == "darwin",
+    "wedges run-tests on macOS GH runners (no per-test output streamed for "
+    "5+ min before cancel); race was characterised against the production "
+    "Linux/Docker harness, which is what the regression guards. macOS "
+    "passes the headless-smoke and harness-smoke gates that exercise the "
+    "same code path on a different runtime.",
+)
 class TestResolvePositionPostAssignRace(HelperTestBase):
     """`resolve_position` absorbs the post-assign race against a fresh
     synthetic syntax (#70). Two race shapes are observable on the first
