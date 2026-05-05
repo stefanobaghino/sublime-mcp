@@ -95,7 +95,9 @@ Reach for this skill when the question is "what does Sublime Text do / see / say
 
 If borderline, say which way you're leaning in one sentence, then proceed.
 
-## 3. The one tool and its contract
+## 3. The tools and their contracts
+
+### 3.1 exec_sublime_python
 
 `mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
 
@@ -112,6 +114,18 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
 **Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
+
+### 3.2 health_check
+
+`mcp__sublime-text__health_check({})` is a worker-thread-only probe that detects when ST's main thread is wedged. It returns within ~2.5s regardless of main-thread state and never goes near the 60s `exec_sublime_python` ceiling. Response shape:
+
+```json
+{ "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "st_version": 4200, "st_channel": "stable" }
+```
+
+**Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Ask the user to restart the container; do not retry. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
+
+**`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. Recovery requires a true container restart (`docker kill $(docker ps --filter label=sublime-mcp-harness -q)`, then re-register). Don't read "Reconnected" as "wedge cleared."
 
 ## 4. Recipes
 

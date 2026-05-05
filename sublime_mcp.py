@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1484,21 +1485,89 @@ def _exec_on_worker(code):
     return result
 
 
-def _tool_descriptor():
-    return {
-        "name": "exec_sublime_python",
-        "description": TOOL_DESCRIPTION,
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python source to exec inside Sublime Text's plugin host.",
-                }
+_HEALTH_CHECK_DESCRIPTION = (
+    "Worker-thread-only probe that detects when ST's main thread is "
+    "wedged. Returns within ~2.5s regardless of main-thread state — "
+    "schedules a no-op via sublime.set_timeout(..., 0) and waits at most "
+    "2.0s for it to fire. Use before issuing main-thread-touching "
+    "exec_sublime_python calls if the previous exec timed out at the 60s "
+    "ceiling. If main_thread_responsive is False, ask the user to restart "
+    "the container — `/mcp` reconnect does not clear the wedge."
+)
+
+
+def _tool_descriptors():
+    return [
+        {
+            "name": "exec_sublime_python",
+            "description": TOOL_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "Python source to exec inside Sublime Text's plugin host.",
+                    }
+                },
+                "required": ["code"],
             },
-            "required": ["code"],
         },
+        {
+            "name": "health_check",
+            "description": _HEALTH_CHECK_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    ]
+
+
+_MAIN_THREAD_PROBE_TIMEOUT_S = 2.0
+
+
+def _run_health_check():
+    """Probe ST main-thread responsiveness without touching `_exec_on_worker`.
+
+    Schedules `done.set` via `sublime.set_timeout(..., 0)` and waits up to
+    `_MAIN_THREAD_PROBE_TIMEOUT_S` seconds. The wait runs on the HTTP
+    request thread (a daemon) so this returns even when ST's main thread
+    is wedged — point of the whole fix per #73.
+    """
+    done = threading.Event()
+    started = time.monotonic()
+    try:
+        sublime.set_timeout(done.set, 0)
+    except Exception:
+        # set_timeout itself failing means ST is not just wedged but gone.
+        # Treat as unresponsive; let the caller branch on it.
+        logger.warning("health_check: sublime.set_timeout raised", exc_info=True)
+        responsive = False
+    else:
+        responsive = done.wait(_MAIN_THREAD_PROBE_TIMEOUT_S)
+    elapsed = time.monotonic() - started
+    if _startup_monotonic is not None:
+        uptime_s = int(time.monotonic() - _startup_monotonic)
+    else:
+        uptime_s = 0
+    payload = {
+        "main_thread_responsive": bool(responsive),
+        "main_thread_probe_elapsed_s": round(elapsed, 3),
+        "plugin_host_pid": os.getpid(),
+        "uptime_s": uptime_s,
+        "container_id": os.environ.get("HOSTNAME") or None,
+        "st_version": int(sublime.version()),
+        "st_channel": sublime.channel(),
     }
+    logger.info(
+        "health_check responsive=%s elapsed=%.2fs uptime=%ds pid=%d",
+        payload["main_thread_responsive"],
+        payload["main_thread_probe_elapsed_s"],
+        payload["uptime_s"],
+        payload["plugin_host_pid"],
+    )
+    return payload
 
 
 def _dispatch(message):
@@ -1525,34 +1594,45 @@ def _dispatch(message):
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {"tools": [_tool_descriptor()]},
+            "result": {"tools": _tool_descriptors()},
         }
 
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
-        if name != "exec_sublime_python":
+        if name == "exec_sublime_python":
+            code = arguments.get("code")
+            if not isinstance(code, str):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": "arguments.code must be a string"},
+                }
+            outcome = _exec_on_worker(code)
+            text = json.dumps(outcome, indent=2, default=str)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "error": {"code": -32602, "message": "unknown tool: %s" % name},
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": outcome["error"] is not None,
+                },
             }
-        code = arguments.get("code")
-        if not isinstance(code, str):
+        if name == "health_check":
+            payload = _run_health_check()
+            text = json.dumps(payload, indent=2, default=str)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "error": {"code": -32602, "message": "arguments.code must be a string"},
+                "result": {
+                    "content": [{"type": "text", "text": text}],
+                    "isError": False,
+                },
             }
-        outcome = _exec_on_worker(code)
-        text = json.dumps(outcome, indent=2, default=str)
         return {
             "jsonrpc": "2.0",
             "id": req_id,
-            "result": {
-                "content": [{"type": "text", "text": text}],
-                "isError": outcome["error"] is not None,
-            },
+            "error": {"code": -32602, "message": "unknown tool: %s" % name},
         }
 
     if method == "ping":
@@ -1653,11 +1733,14 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 _server = None
 _thread = None
+_startup_monotonic = None
 
 
 def plugin_loaded():
-    global _server, _thread
+    global _server, _thread, _startup_monotonic
     _configure_bridge_logging()
+    if _startup_monotonic is None:
+        _startup_monotonic = time.monotonic()
     if _server is not None:
         return
     try:
