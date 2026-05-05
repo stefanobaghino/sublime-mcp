@@ -257,10 +257,13 @@ def make_bridge_log_file() -> str:
     Pinned to `/tmp` (rather than the platform default `tempfile.gettempdir()`)
     so the path is always inside Docker Desktop's default filesystem
     sharing on macOS — `/var/folders/...` (the default TMPDIR there)
-    is not always shared.
+    is not always shared. `chmod 0666` so any UID inside the container
+    can append to the bind-mounted file (Linux Docker doesn't always
+    map container root to host root in CI).
     """
     fd, path = tempfile.mkstemp(prefix="sublime-mcp-bridge-", suffix=".log", dir="/tmp")
     os.close(fd)
+    os.chmod(path, 0o666)
     return path
 
 

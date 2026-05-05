@@ -168,6 +168,17 @@ def _parsed_lines(captured: list) -> list:
     return out
 
 
+# UnitTesting (the SublimeText/UnitTesting GitHub action) auto-discovers
+# every `test_*.py` under `tests/` and runs it inside ST's plugin host.
+# This module drives a Docker subprocess, so it would always error out
+# in that context — gate the whole class so it's recorded as skipped.
+_RUNNING_IN_SUBLIME = "sublime" in sys.modules
+
+
+@unittest.skipIf(
+    _RUNNING_IN_SUBLIME,
+    "test_logging.py drives a host-side Docker harness; not applicable inside ST plugin host",
+)
 class TestUnifiedLogging(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -213,9 +224,14 @@ class TestUnifiedLogging(unittest.TestCase):
         for_99 = [ln for ln in lines if ln["req"] == "99"]
         bridge_for_99 = [ln for ln in for_99 if ln["component"] == "bridge"]
         msgs = " | ".join(ln["msg"] for ln in bridge_for_99)
-        self.assertIn("worker entered", msgs, "missing 'worker entered': %s" % msgs)
-        self.assertIn("snippet exec begin", msgs, "missing 'snippet exec begin': %s" % msgs)
-        self.assertIn("snippet exec done", msgs, "missing 'snippet exec done': %s" % msgs)
+        # Dump the full stderr blob inline on failure so CI logs reveal
+        # whether bridge lines never arrived vs. arrived but with the
+        # wrong req-id.
+        full_blob = b"".join(captured).decode("utf-8", "replace")
+        diag = "\n--- captured stderr ---\n%s\n--- end captured ---" % full_blob
+        self.assertIn("worker entered", msgs, "missing 'worker entered': %s%s" % (msgs, diag))
+        self.assertIn("snippet exec begin", msgs, "missing 'snippet exec begin': %s%s" % (msgs, diag))
+        self.assertIn("snippet exec done", msgs, "missing 'snippet exec done': %s%s" % (msgs, diag))
 
     def test_format_columns_present_at_default_level(self) -> None:
         """Boot-time log lines render in the expected column shape."""
