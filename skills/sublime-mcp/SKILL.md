@@ -33,13 +33,57 @@ docker ps --filter label=sublime-mcp-harness --format '{{.ID}} {{.Status}}'
 
 Expected: `claude mcp list` shows `sublime-text ✓ Connected`; `docker ps` shows one running container per active agent session. If the registration is missing or shows ✗, point the user at `install.md` in this skill's directory. If the registration is healthy but the container is missing, the harness is failing to boot — read its stderr (Claude Code surfaces it in the MCP log; on the user's side, `claude mcp logs sublime-text` if available, otherwise the harness's stderr stream during connection).
 
-Common boot-time failures the harness signals on stderr (`[sublime-mcp-harness] ERROR: …`):
+Common boot-time failures the harness signals on stderr (look for `ERROR  [harness]`):
 
-- `docker not found on PATH` — install Docker and ensure the daemon is running.
+- `docker unavailable` — install Docker and ensure the daemon is running.
 - `Sublime Text never opened a window` — Xvfb or licensing issue inside the container; check `docker logs <cid>`.
 - `docker build failed` — image build broke; re-run with `--rebuild` after fixing.
 
+Steady-state failures (timeout, hang, surprising scope) have their own diagnostic surface — see §1.1 below.
+
 Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
+
+## 1.1 Reading the unified log stream
+
+The harness emits a single stderr stream that interleaves three components into one column shape:
+
+```
+2026-05-05T14:22:08.117  DEBUG    [harness]  req=42  forwarding method=tools/call bytes=1284
+2026-05-05T14:22:08.118  DEBUG    [bridge]   req=42  do_POST received bytes=1284 path=/mcp
+2026-05-05T14:22:08.119  INFO     [bridge]   req=42  worker entered
+2026-05-05T14:22:08.120  INFO     [bridge]   req=42  snippet exec begin code_bytes=312
+2026-05-05T14:22:08.123  INFO     [bridge]   req=42  snippet exec done error=no output_bytes=0
+2026-05-05T14:22:08.124  DEBUG    [harness]  req=42  received status=200 bytes=189
+```
+
+Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>`  `<message>`. Components: `[harness]` (host-side proxy), `[bridge]` (in-container plugin), `[st]` (anything else from the container's stdout/stderr — ST itself, plugin tracebacks, package_control noise).
+
+**Read channels.** Live: harness stderr — `claude mcp logs sublime-text` if your build of Claude Code surfaces it, otherwise whatever stderr surface the host platform exposes. Historical: `docker logs <cid>` replays the container's stdout/stderr from container start (bridge + st only — no `[harness]` lines, since the harness runs on the host).
+
+**Levels.**
+
+- `ERROR` — a request will fail to return useful data. Worker timeout always fires a `faulthandler.dump_traceback(all_threads=True)` on the same line for every Python thread's stack.
+- `WARNING` — silent-fallback shapes the caller is likely to misinterpret (`requested_syntax != resolved_syntax`, `run_on_main` 2 s timeout fires before the worker's 60 s ceiling, `assign_syntax_and_wait` stage-1 timeout).
+- `INFO` — boundary events: container boot/ready/shutdown, sweep removals, **and** `worker entered` / `snippet exec begin` / `snippet exec done` per call. Default level — sufficient for #73-class diagnosis without DEBUG firehose.
+- `DEBUG` — proxy-loop trail (`forwarding`/`received`), helper-entry traces (`assign_syntax_and_wait` etc.), `_compile_snippet` auto-lift branch.
+
+**Troubleshooting workflow.**
+
+1. **Observe** the failure (timeout, error response, surprising scope).
+2. **Read backward** with `docker logs <cid>` to see the historical INFO trail leading up to the failure. Grep for the `req=<id>` of the failing request to isolate its path through the bridge.
+3. **If the INFO trail isn't enough**, bump the bridge to DEBUG live — no restart needed: drive `exec_sublime_python` with `import logging; logging.getLogger("sublime_mcp.bridge").setLevel(logging.DEBUG)` and reproduce. Only works while the bridge is responsive (i.e. before a wedge); during an active wedge, bumping the level is moot — the diagnostic information is in the `faulthandler` dump that already fired at ERROR.
+4. **If the harness side is suspect**, restart with `--log-level DEBUG` (or set `SUBLIME_MCP_LOG_LEVEL=DEBUG` in the harness's environment); harness level is fixed per-session.
+
+**Common patterns.**
+
+| Symptom (in `error` field) | Trail shape | Likely cause |
+|----------------------------|-------------|--------------|
+| `exec timed out after 60.0s` | no preceding `[bridge] worker entered` | bridge couldn't dispatch the worker (rare; check for plugin host crash). |
+| `exec timed out after 60.0s` | `[bridge] worker entered`, `[bridge] snippet exec begin`, no `[bridge] snippet exec done`, ends in `[bridge] ERROR worker did not complete in 60.0s; worker thread is_alive=True` plus a multi-line `faulthandler` traceback | snippet wedged on ST's main thread (canonical #73). The `faulthandler` dump pinpoints the thread waiting on `run_on_main` or similar. |
+| `container HTTP error: ...` | no preceding `[st]` traceback | container died (likely OOM / SIGKILL). Check `docker ps --filter label=sublime-mcp-harness`. |
+| `[st]` Python traceback with no `[bridge]` lines after | bridge thread crashed on an uncaught plugin-host exception | restart the harness; consider filing the traceback as a bridge bug. |
+
+**Surfacing to the user.** Don't dump the whole trail — pull the ~30 lines around the failure boundary and grep for the failing `req=<id>`. The user's session already has the harness stderr; you're highlighting the relevant slice.
 
 ## 2. Decide whether this skill is the right call
 
@@ -273,8 +317,9 @@ _ = results
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-05-04._
+_Last synced with issue state: 2026-05-05._
 
+- **Log levels are part of the contract; log line format is best-effort.** The four-level meaning (ERROR / WARNING / INFO / DEBUG) and the column positions of `req=<id>` are stable within a release line. The exact wording of individual messages and their phrasing may change between releases.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
 - **whole-tree mirror** (follow-up to #24) — `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.

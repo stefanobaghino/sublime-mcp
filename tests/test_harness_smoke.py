@@ -25,7 +25,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 HARNESS = REPO / "harness.py"
-READY_LINE = b"[sublime-mcp-harness] ready"
+# Matches the unified-log "ready on 127.0.0.1:<port> (container ...)" line.
+# Re-stamping the harness's `log()` helper to use `logging` shifted the
+# prefix from `[sublime-mcp-harness] ready` to `[harness]  req=-  ready`;
+# the substring `ready on` is stable across both.
+READY_LINE = b"ready on 127.0.0.1"
 READY_TIMEOUT_S = 600.0  # cold-build budget; subsequent runs are fast
 
 
