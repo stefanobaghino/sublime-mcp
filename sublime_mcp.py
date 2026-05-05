@@ -505,7 +505,16 @@ v.close()
 
 ## Gotchas
 
-- Hard timeout per call is 60 s.
+- Hard timeout per call is 60 s. An optional `timeout_seconds`
+  argument lowers the ceiling for a single call (clamped to
+  `[0.1, 60.0]`). On per-call expiry the response carries
+  `error: "snippet exceeded the per-call timeout of <X>s"`,
+  distinct from the transport-ceiling
+  `error: "exec timed out after 60.0s"` wording — useful for
+  adversarial probes where a hang is itself the answer ("does ST
+  loop on this regex?"). The worker thread is left running on
+  expiry (the Python interpreter does not interrupt running
+  threads); `daemon=True` keeps it from blocking unload.
 - A `view.scope_name(point)` call on an already-tokenised view costs
   around 150 µs (measured: 5 × 500-sample medians on a 1.2k-line
   Python source view, ST 4200 stable); a several-hundred-position
@@ -1411,7 +1420,7 @@ def _compile_snippet(code):
     return compile(tree, "<sublime-mcp-snippet>", "exec")
 
 
-def _exec_on_worker(code):
+def _exec_on_worker(code, timeout_seconds=None):
     """Run `code` on a dedicated daemon thread and collect output.
 
     Returns a dict with keys `output`, `result`, `error`, `st_version`,
@@ -1426,7 +1435,25 @@ def _exec_on_worker(code):
     `workspace_path` is the contract anchor for paths passed into
     helpers — always `/work` when the user followed install instructions
     (#76).
+
+    `timeout_seconds` lowers the default `EXEC_TIMEOUT_SECONDS` ceiling
+    for a single call (clamped to `[0.1, EXEC_TIMEOUT_SECONDS]`). On
+    per-call expiry the response carries
+    `error: "snippet exceeded the per-call timeout of <X>s"`, distinct
+    from the transport-ceiling wording so callers can branch on which
+    deadline fired (#62). Only useful for adversarial probes where a
+    hang is itself the answer.
     """
+    if timeout_seconds is None:
+        effective_timeout = EXEC_TIMEOUT_SECONDS
+    else:
+        requested = float(timeout_seconds)
+        effective_timeout = max(0.1, min(requested, EXEC_TIMEOUT_SECONDS))
+        if effective_timeout != requested:
+            logger.warning(
+                "timeout_seconds=%s clamped to %ss (range [0.1, %ss])",
+                timeout_seconds, effective_timeout, EXEC_TIMEOUT_SECONDS,
+            )
     done = threading.Event()
     # ST guarantees `sublime.version()` is a stringified integer; cast
     # at the boundary so callers don't reparse.
@@ -1503,14 +1530,23 @@ def _exec_on_worker(code):
     worker = threading.Thread(target=run, name="sublime-mcp-exec", daemon=True)
     logger.info("starting worker code_bytes=%d", len(code))
     worker.start()
-    if not done.wait(EXEC_TIMEOUT_SECONDS):
+    if not done.wait(effective_timeout):
         # Reuse the pre-populated `st_version` / `st_channel` from the
         # initial dict so the envelope shape stays uniform across the
         # success and timeout paths.
-        result["error"] = "exec timed out after %ss" % EXEC_TIMEOUT_SECONDS
+        if timeout_seconds is not None and effective_timeout < EXEC_TIMEOUT_SECONDS:
+            # Per-call override fired below the transport ceiling — surface
+            # a distinct wording so callers can tell "my probe answered
+            # 'looks like ST loops on this input'" apart from "the
+            # environment timed out at the 60s ceiling".
+            result["error"] = (
+                "snippet exceeded the per-call timeout of %ss" % effective_timeout
+            )
+        else:
+            result["error"] = "exec timed out after %ss" % EXEC_TIMEOUT_SECONDS
         logger.error(
             "worker did not complete in %ss; worker thread is_alive=%s",
-            EXEC_TIMEOUT_SECONDS,
+            effective_timeout,
             worker.is_alive(),
         )
         # Best-effort all-thread Python stack dump. When the snippet is
@@ -1550,7 +1586,16 @@ def _tool_descriptors():
                     "code": {
                         "type": "string",
                         "description": "Python source to exec inside Sublime Text's plugin host.",
-                    }
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": (
+                            "Optional per-call timeout in seconds, clamped to [0.1, 60.0]. "
+                            "Default uses the 60s transport ceiling."
+                        ),
+                        "minimum": 0.1,
+                        "maximum": 60.0,
+                    },
                 },
                 "required": ["code"],
             },
@@ -1652,7 +1697,17 @@ def _dispatch(message):
                     "id": req_id,
                     "error": {"code": -32602, "message": "arguments.code must be a string"},
                 }
-            outcome = _exec_on_worker(code)
+            timeout_seconds = arguments.get("timeout_seconds")
+            if timeout_seconds is not None and not isinstance(timeout_seconds, (int, float)):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "arguments.timeout_seconds must be a number",
+                    },
+                }
+            outcome = _exec_on_worker(code, timeout_seconds=timeout_seconds)
             text = json.dumps(outcome, indent=2, default=str)
             return {
                 "jsonrpc": "2.0",
