@@ -62,13 +62,19 @@ LOG_LINE_RE = re.compile(
 )
 
 
-def _spawn_harness(env: dict | None = None) -> subprocess.Popen:
+def _spawn_harness(
+    env: dict | None = None,
+    extra_args: list[str] | None = None,
+) -> subprocess.Popen:
     full_env = os.environ.copy()
     full_env["PYTHONUNBUFFERED"] = "1"
     if env:
         full_env.update(env)
+    cmd = [sys.executable, "-u", str(HARNESS)]
+    if extra_args:
+        cmd.extend(extra_args)
     return subprocess.Popen(
-        [sys.executable, "-u", str(HARNESS)],
+        cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -382,6 +388,7 @@ class TestHealthCheck(unittest.TestCase):
             "plugin_host_pid",
             "uptime_s",
             "container_id",
+            "workspace_path",
             "st_version",
             "st_channel",
         ):
@@ -391,6 +398,7 @@ class TestHealthCheck(unittest.TestCase):
         self.assertGreater(payload["plugin_host_pid"], 0)
         self.assertGreaterEqual(payload["uptime_s"], 0)
         self.assertGreater(payload["st_version"], 4000)
+        self.assertEqual(payload["workspace_path"], "/work", payload)
         # End-to-end roundtrip well under the 60s ceiling — proves the
         # tool isn't accidentally routed through `_exec_on_worker`.
         self.assertLess(elapsed, 5.0, "responsive health_check took %.2fs" % elapsed)
@@ -458,6 +466,120 @@ class TestHealthCheck(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    _RUNNING_IN_SUBLIME,
+    "test_logging.py drives a host-side Docker harness; not applicable inside ST plugin host",
+)
+class TestExecSublimePythonEnvelope(unittest.TestCase):
+    """Coverage for the situational-awareness fields on `exec_sublime_python` (#74, #76).
+
+    `container_id` lets a host-side recovery script identify which
+    `sublime-mcp-harness` container owns a given response without
+    grep-and-reverse-mapping artefact filenames. `workspace_path` is the
+    contract anchor for paths the agent passes back into helpers.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not _docker_available():
+            raise unittest.SkipTest("docker not available")
+
+    def test_envelope_includes_container_id_and_workspace_path(self) -> None:
+        proc = _spawn_harness()
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_sublime_python",
+                    "arguments": {"code": "2 + 2\n"},
+                },
+            })
+            resp = _recv(proc, timeout_s=DEFAULT_CALL_TIMEOUT_S)
+        finally:
+            _shutdown(proc)
+
+        self.assertEqual(resp.get("id"), 11, resp)
+        self.assertFalse(resp["result"]["isError"], resp)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        for key in (
+            "output",
+            "result",
+            "error",
+            "st_version",
+            "st_channel",
+            "container_id",
+            "workspace_path",
+        ):
+            self.assertIn(key, payload, payload)
+        self.assertIsNone(payload["error"], payload)
+        self.assertEqual(payload["result"], "4", payload)
+        self.assertEqual(payload["workspace_path"], "/work", payload)
+        # `HOSTNAME` inside Docker is the 12-char short cid.
+        cid = payload["container_id"]
+        self.assertIsInstance(cid, str, payload)
+        self.assertRegex(cid, r"^[0-9a-f]{12}$", payload)
+
+
+@unittest.skipIf(
+    _RUNNING_IN_SUBLIME,
+    "test_logging.py drives a host-side Docker harness; not applicable inside ST plugin host",
+)
+class TestHarnessSelfMountWarning(unittest.TestCase):
+    """`plugin_loaded()` warns when /work shadows the harness source repo (#76)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _docker_available():
+            raise unittest.SkipTest("docker not available")
+
+    def test_warning_fires_when_repo_mounted_at_work(self) -> None:
+        # Mounting the repo at /work is the canonical mistake: the user
+        # registered the MCP server from inside the sublime-mcp source
+        # tree. Both `sublime_mcp.py` and `Dockerfile` are present at
+        # the top, which is the predicate the helper checks.
+        proc = _spawn_harness(extra_args=["--mount", "%s:/work" % REPO])
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            # The warning is emitted from `plugin_loaded` before the
+            # HTTP-server bind, but the bridge logger's writes race
+            # the harness's tail thread; drain a beat to avoid flake.
+            _drain_stderr(proc, captured, until_s=1.5)
+        finally:
+            _shutdown(proc)
+            if proc.stderr is not None:
+                tail = proc.stderr.read()
+                if tail:
+                    captured.append(tail)
+
+        blob = b"".join(captured).decode("utf-8", "replace")
+        self.assertRegex(
+            blob,
+            r"WARNING\s+\[bridge\].*appears to be the harness source repo",
+            "expected harness-self-mount warning in unified log stream",
+        )
+
+    def test_warning_silent_without_mount(self) -> None:
+        proc = _spawn_harness()
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            _drain_stderr(proc, captured, until_s=1.0)
+        finally:
+            _shutdown(proc)
+            if proc.stderr is not None:
+                tail = proc.stderr.read()
+                if tail:
+                    captured.append(tail)
+
+        blob = b"".join(captured).decode("utf-8", "replace")
+        self.assertNotIn("appears to be the harness source repo", blob)
+
+
 def run() -> int:
     if not _docker_available():
         print("SKIP: docker not available", file=sys.stderr)
@@ -466,6 +588,8 @@ def run() -> int:
     suite = unittest.TestSuite([
         loader.loadTestsFromTestCase(TestUnifiedLogging),
         loader.loadTestsFromTestCase(TestHealthCheck),
+        loader.loadTestsFromTestCase(TestExecSublimePythonEnvelope),
+        loader.loadTestsFromTestCase(TestHarnessSelfMountWarning),
     ])
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
