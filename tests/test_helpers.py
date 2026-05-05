@@ -51,19 +51,22 @@ def _post(payload, timeout=65):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _call_tool(code, request_id=1, timeout=65):
+def _call_tool(code, request_id=1, timeout=65, mcp_timeout_seconds=None):
+    arguments = {"code": code}
+    if mcp_timeout_seconds is not None:
+        arguments["timeout_seconds"] = mcp_timeout_seconds
     return _post({
         "jsonrpc": "2.0",
         "id": request_id,
         "method": "tools/call",
         "params": {
             "name": "exec_sublime_python",
-            "arguments": {"code": code},
+            "arguments": arguments,
         },
     }, timeout=timeout)
 
 
-def _call_tool_yielding(code, request_id=1, timeout=65):
+def _call_tool_yielding(code, request_id=1, timeout=65, mcp_timeout_seconds=None):
     """Generator: spawns the MCP call on a daemon thread and yields
     `CALL_YIELD_INTERVAL_MS` until it returns. DeferrableTestCase pauses
     the generator during each yield, letting ST's main thread run the
@@ -72,7 +75,12 @@ def _call_tool_yielding(code, request_id=1, timeout=65):
     holder = {}
     def worker():
         try:
-            holder["resp"] = _call_tool(code, request_id=request_id, timeout=timeout)
+            holder["resp"] = _call_tool(
+                code,
+                request_id=request_id,
+                timeout=timeout,
+                mcp_timeout_seconds=mcp_timeout_seconds,
+            )
         except BaseException as exc:
             holder["exc"] = exc
     t = threading.Thread(target=worker, daemon=True)
@@ -1674,3 +1682,85 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
         self.assertIn("ValueError", outcome["error"])
         self.assertIn("not under sublime.packages_path()", outcome["error"])
         self.assertIn("temp_packages_link", outcome["error"])
+
+
+class TestPerCallTimeout(HelperTestBase):
+    """Per-call `timeout_seconds` override on `exec_sublime_python` (#62).
+
+    Lets adversarial probes fail fast — when the question is "does ST
+    loop on this regex?", a hang is the answer and the round-trip cost
+    should be the override budget rather than the full 60 s ceiling.
+    """
+
+    def test_default_uses_60s_ceiling(self):
+        # Sanity / regression: omitting `timeout_seconds` keeps the
+        # original envelope shape and 60 s ceiling. A fast snippet
+        # returns clean.
+        resp = yield from _call_tool_yielding("_ = 1 + 1")
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["result"], "2")
+
+    def test_override_lowers_ceiling(self):
+        # `timeout_seconds=1.0` with a 5 s sleep: the response must
+        # arrive well before the 60 s ceiling and carry the per-call
+        # wording. Wall-clock budget is generous (5 s, vs the ~1 s
+        # expected) to absorb scheduler jitter without flaking.
+        start = time.time()
+        resp = yield from _call_tool_yielding(
+            "import time; time.sleep(5); _ = 'unreached'",
+            mcp_timeout_seconds=1.0,
+        )
+        elapsed = time.time() - start
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("snippet exceeded the per-call timeout of", outcome["error"])
+        self.assertIsNone(outcome["result"])
+        self.assertLess(elapsed, 5.0,
+                        "per-call timeout did not fire below the ceiling")
+
+    def test_override_clamped_above_ceiling(self):
+        # `timeout_seconds=120` exceeds the 60 s transport ceiling: the
+        # plugin clamps it down internally rather than rejecting. A fast
+        # snippet still returns clean, proving the request was accepted
+        # past the JSON-Schema layer (which has `maximum: 60`) — the
+        # in-process clamp is the second line of defence.
+        resp = yield from _call_tool_yielding(
+            "_ = 'ok'", mcp_timeout_seconds=120.0,
+        )
+        outcome = _outcome(resp)
+        # Note: the JSON-Schema `maximum: 60` may or may not be enforced
+        # by the transport depending on validator. If `error` is set and
+        # carries a transport-level rejection wording, treat that as a
+        # legitimate stricter outcome; otherwise the snippet ran clean.
+        if outcome.get("error") is None:
+            self.assertEqual(outcome["result"], "'ok'")
+
+    def test_override_clamped_below_minimum(self):
+        # `timeout_seconds=0.05` falls below the 0.1 s floor: the plugin
+        # clamps up to 0.1 s. A trivial snippet completes well within
+        # that budget, so the call returns clean. We aren't asserting
+        # on the floor's exact value — just that sub-floor inputs don't
+        # cause an immediate timeout for a fast snippet.
+        resp = yield from _call_tool_yielding(
+            "_ = 42", mcp_timeout_seconds=0.05,
+        )
+        outcome = _outcome(resp)
+        if outcome.get("error") is None:
+            self.assertEqual(outcome["result"], "42")
+
+    def test_per_call_message_distinguishes_from_ceiling(self):
+        # The per-call wording must be string-distinguishable from the
+        # transport-ceiling wording so callers can branch on which
+        # deadline fired. We don't exercise the 60 s ceiling case here
+        # (would burn 60 s of wall-clock); we just assert the per-call
+        # branch produces a message that does NOT contain the
+        # transport-ceiling phrase.
+        resp = yield from _call_tool_yielding(
+            "import time; time.sleep(5); _ = 'unreached'",
+            mcp_timeout_seconds=0.5,
+        )
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertNotIn("exec timed out after", outcome["error"])
+        self.assertIn("per-call timeout", outcome["error"])

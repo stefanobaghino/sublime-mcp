@@ -109,7 +109,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 ### 3.1 exec_sublime_python
 
-`mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
+`mcp__sublime-text__exec_sublime_python({ code, timeout_seconds? })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
 
 ```json
 { "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "container_id": "<docker cid>", "workspace_path": "/work", "isError": false }
@@ -120,6 +120,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 - `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
 - `container_id` is the Docker short cid of the harness container handling the call. When recovery requires `docker kill` / `docker exec`, use this field rather than `docker ps --filter label=sublime-mcp-harness -q` (which lists *every* harness container on the host — multiple Claude Code sessions can run concurrently).
 - `workspace_path` is the in-container mount root paths resolve against — always `/work` when the user followed the install instructions. Treat it as the contract anchor: every path argument you pass to `scope_at` / `run_syntax_tests` / `open_view` is interpreted against this root.
+- Optional `timeout_seconds` (clamped to `[0.1, 60.0]`) lowers the 60 s ceiling for a single call. On expiry the response carries `error: "snippet exceeded the per-call timeout of <X>s"`, distinct from the transport-ceiling `error: "exec timed out after 60.0s"`. Use it for adversarial probes where a hang is the probe's answer ("does ST loop on this regex?") so the round-trip cost is the override budget rather than the full 60 s.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
