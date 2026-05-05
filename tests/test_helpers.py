@@ -1738,16 +1738,16 @@ class TestPerCallTimeout(HelperTestBase):
 
     def test_override_clamped_below_minimum(self):
         # `timeout_seconds=0.05` falls below the 0.1 s floor: the plugin
-        # clamps up to 0.1 s. A trivial `pass` snippet completes well
-        # within that budget, so the call returns clean. We aren't
-        # asserting on the floor's exact value — just that sub-floor
-        # inputs don't cause an immediate timeout for a fast snippet.
+        # clamps up to 0.1 s. A trivial snippet completes well within
+        # that budget, so the call returns clean. We aren't asserting
+        # on the floor's exact value — just that sub-floor inputs don't
+        # cause an immediate timeout for a fast snippet.
         resp = yield from _call_tool_yielding(
-            "_ = None", mcp_timeout_seconds=0.05,
+            "_ = 42", mcp_timeout_seconds=0.05,
         )
         outcome = _outcome(resp)
         if outcome.get("error") is None:
-            self.assertEqual(outcome["result"], "None")
+            self.assertEqual(outcome["result"], "42")
 
     def test_per_call_message_distinguishes_from_ceiling(self):
         # The per-call wording must be string-distinguishable from the
