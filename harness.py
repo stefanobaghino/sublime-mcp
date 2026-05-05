@@ -244,27 +244,7 @@ def ensure_image(tag: str, force: bool, context: Path) -> None:
             logger.info("reusing image %s", tag)
 
 
-CONTAINER_LOG_FILE = "/tmp/sublime-mcp.log"
-
-
-def make_bridge_log_file() -> str:
-    """Create a host-side scratch file for the bridge to log into.
-
-    Mounted at `CONTAINER_LOG_FILE` inside the container; the harness
-    tails it directly to avoid `docker exec` overhead. Caller is
-    responsible for removing the file on shutdown.
-
-    Pinned to `/tmp` (rather than the platform default `tempfile.gettempdir()`)
-    so the path is always inside Docker Desktop's default filesystem
-    sharing on macOS — `/var/folders/...` (the default TMPDIR there)
-    is not always shared. `chmod 0666` so any UID inside the container
-    can append to the bind-mounted file (Linux Docker doesn't always
-    map container root to host root in CI).
-    """
-    fd, path = tempfile.mkstemp(prefix="sublime-mcp-bridge-", suffix=".log", dir="/tmp")
-    os.close(fd)
-    os.chmod(path, 0o666)
-    return path
+CONTAINER_LOG_FILE = "/tmp/sublime-mcp-bridge.log"
 
 
 def run_container(
@@ -272,7 +252,6 @@ def run_container(
     mounts: list[str],
     license_file: str | None,
     log_level: str = "INFO",
-    bridge_log_path: str | None = None,
 ) -> str:
     args = [
         "docker", "run",
@@ -281,12 +260,8 @@ def run_container(
         "--label", "sublime-mcp-harness=%d" % os.getpid(),
         "-p", "127.0.0.1:0:%d" % CONTAINER_PORT,
         "-e", "SUBLIME_MCP_LOG_LEVEL=%s" % log_level,
+        "-e", "SUBLIME_MCP_LOG_FILE=%s" % CONTAINER_LOG_FILE,
     ]
-    if bridge_log_path:
-        args += [
-            "-e", "SUBLIME_MCP_LOG_FILE=%s" % CONTAINER_LOG_FILE,
-            "-v", "%s:%s" % (bridge_log_path, CONTAINER_LOG_FILE),
-        ]
     for spec in mounts:
         args += ["-v", spec]
     if license_file:
@@ -547,79 +522,62 @@ def _make_error_response(request_bytes: bytes, message: str) -> bytes:
 # Bridge log tail
 
 
-def _tail_bridge_log(path: str, stop_event: threading.Event) -> None:
-    """Tail the host-side bridge log file into the harness's unified stream.
+def _tail_bridge_log(cid: str, stop_event: threading.Event) -> None:
+    """Tail the bridge log file from inside the container into harness stderr.
 
-    The bridge writes to `CONTAINER_LOG_FILE` inside the container,
-    which is bind-mounted onto `path` on the host. ST self-daemonizes
-    so its plugin host's `sys.stderr` doesn't reach `docker logs`; the
-    file mount is the load-bearing surface for the bridge's lines.
+    The bridge writes to `CONTAINER_LOG_FILE` inside the container —
+    not a bind-mounted host file. ST's plugin host can't reliably
+    write to a host bind-mounted file under Linux native Docker (the
+    plugin host appears to be running with restrictions that block
+    writes to files owned by other UIDs even at 0666 mode), so the
+    bridge owns the file lifecycle and the harness reads it via
+    `docker exec ... tail -F`.
 
     Lines are pre-formatted by the bridge — pass them through verbatim
     onto stderr. Multi-line `faulthandler` dumps (no `[bridge]` prefix)
     inherit through the same passthrough so the wedged-thread stack
     appears next to the ERROR line that triggered it.
 
-    Exits on `stop_event` set OR a graceful EOF after `stop_event` is
-    raised (container teardown). Polls the file rather than using
-    `docker logs --follow` because ST's daemonization detaches its I/O
-    from PID 1.
-
-    On exit, logs the byte count it forwarded and the file's final
-    size — divergence between the two surfaces a "tail saw nothing
-    but bridge did write" failure mode (and vice versa) instead of
-    leaving it indistinguishable from "bridge silently never logged".
+    Exits on `stop_event` set OR EOF from `tail` (container exited).
+    The `-n +1` flag streams the file from the start, so boot-time
+    bridge events make it through even if the tail thread starts
+    after they were emitted.
     """
     stderr = sys.stderr
-    forwarded_bytes = 0
+    proc = None
     try:
-        f = open(path, "r")
+        proc = subprocess.Popen(
+            ["docker", "exec", "-i", cid, "tail", "-F", "-n", "+1", CONTAINER_LOG_FILE],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
     except OSError as exc:
-        logger.warning("tail thread: cannot open bridge log %r: %r", path, exc)
+        logger.warning("tail thread: failed to spawn `docker exec tail`: %r", exc)
         return
+    forwarded_bytes = 0
+    assert proc.stdout is not None
     try:
         while not stop_event.is_set():
-            chunk = f.read()
-            if chunk:
-                stderr.write(chunk)
-                stderr.flush()
-                forwarded_bytes += len(chunk.encode("utf-8", "replace"))
-            else:
-                time.sleep(0.1)
-        # Drain anything written between the last poll and shutdown.
-        chunk = f.read()
-        if chunk:
-            stderr.write(chunk)
+            line = proc.stdout.readline()
+            if not line:
+                logger.info("tail thread: docker exec tail returned EOF — container has exited")
+                return
+            stderr.write(line)
             stderr.flush()
-            forwarded_bytes += len(chunk.encode("utf-8", "replace"))
+            forwarded_bytes += len(line.encode("utf-8", "replace"))
     finally:
-        try:
-            f.close()
-        except OSError:
-            pass
-        try:
-            final_size = os.path.getsize(path)
-        except OSError:
-            final_size = -1
-        logger.info(
-            "tail thread: forwarded_bytes=%d file_final_size=%d path=%s",
-            forwarded_bytes,
-            final_size,
-            path,
-        )
-        # If the file was non-trivial but we never forwarded anything,
-        # the polling read missed the writes — dump the file content
-        # for diagnosis. Bound at 16 KiB so a runaway write doesn't
-        # flood stderr.
-        if final_size > 0 and forwarded_bytes == 0:
+        logger.info("tail thread: forwarded_bytes=%d", forwarded_bytes)
+        if proc is not None:
             try:
-                with open(path, "r") as f2:
-                    stderr.write("--- bridge log content (post-mortem) ---\n")
-                    stderr.write(f2.read(16 * 1024))
-                    stderr.write("\n--- end bridge log content ---\n")
-                    stderr.flush()
-            except OSError:
-                pass
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------
@@ -651,23 +609,12 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("docker build failed (exit %d)", exc.returncode)
         return exc.returncode or 1
 
-    bridge_log_path = make_bridge_log_file()
     try:
-        cid = run_container(
-            args.image_tag,
-            args.mount,
-            args.license_file,
-            args.log_level,
-            bridge_log_path=bridge_log_path,
-        )
+        cid = run_container(args.image_tag, args.mount, args.license_file, args.log_level)
     except subprocess.CalledProcessError as exc:
         logger.error("docker run failed (exit %d): %s", exc.returncode, exc.stderr or "")
-        try:
-            os.unlink(bridge_log_path)
-        except OSError:
-            pass
         return exc.returncode or 1
-    logger.info("container started cid=%s bridge_log=%s", cid[:12], bridge_log_path)
+    logger.info("container started cid=%s", cid[:12])
 
     stop_event = threading.Event()
 
@@ -679,7 +626,7 @@ def main(argv: list[str] | None = None) -> int:
 
     tail_thread = threading.Thread(
         target=_tail_bridge_log,
-        args=(bridge_log_path, stop_event),
+        args=(cid, stop_event),
         name="sublime-mcp-tail",
         daemon=True,
     )
@@ -698,43 +645,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 1
     finally:
-        # Snapshot the bridge's view of the log file from inside the
-        # container *before* we tear it down. If the host-side tail
-        # forwarded zero bytes, this distinguishes "bridge wrote
-        # something the bind-mount didn't propagate" from "bridge
-        # never wrote at all."
-        try:
-            result = subprocess.run(
-                ["docker", "exec", cid, "sh", "-c",
-                 "ls -la %s 2>&1; echo '---bridge-log-content---'; cat %s 2>/dev/null | head -c 4096; "
-                 "echo '---init-sentinel---'; cat /tmp/sublime-mcp-init.log 2>&1 | head -c 2048"
-                 % (CONTAINER_LOG_FILE, CONTAINER_LOG_FILE)],
-                capture_output=True, text=True, timeout=5,
-            )
-            logger.info(
-                "in-container bridge log: rc=%d stdout=%r",
-                result.returncode,
-                result.stdout[:3000],
-            )
-        except Exception as exc:
-            logger.debug("in-container diagnostic skipped: %r", exc)
+        # Tell the tail thread to wind down BEFORE stopping the
+        # container so its final lines can drain through the docker
+        # exec pipe; signal handlers set `stop_event` themselves but
+        # the EOF-on-stdin path walks here without setting it.
+        stop_event.set()
+        tail_thread.join(timeout=2.0)
         try:
             stop_container(cid)
         except Exception as exc:
             logger.warning("cleanup of container %s failed: %r", cid[:12], exc)
-        # Tell the tail thread to wind down. EOF on stdin walks us
-        # here without ever setting `stop_event` (signal handlers do
-        # that), so without this the daemon-thread exits when main()
-        # returns and its finally — including the tail-byte dump —
-        # never runs.
-        stop_event.set()
-        # Give the tail thread a beat to drain the final bridge writes
-        # (including any faulthandler dump) before unlinking the file.
-        tail_thread.join(timeout=1.0)
-        try:
-            os.unlink(bridge_log_path)
-        except OSError:
-            pass
 
 
 if __name__ == "__main__":
