@@ -698,6 +698,25 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 1
     finally:
+        # Snapshot the bridge's view of the log file from inside the
+        # container *before* we tear it down. If the host-side tail
+        # forwarded zero bytes, this distinguishes "bridge wrote
+        # something the bind-mount didn't propagate" from "bridge
+        # never wrote at all."
+        try:
+            result = subprocess.run(
+                ["docker", "exec", cid, "sh", "-c",
+                 "ls -la %s 2>&1; echo '---content---'; cat %s 2>/dev/null | head -c 4096"
+                 % (CONTAINER_LOG_FILE, CONTAINER_LOG_FILE)],
+                capture_output=True, text=True, timeout=5,
+            )
+            logger.info(
+                "in-container bridge log: rc=%d stdout=%r",
+                result.returncode,
+                result.stdout[:2000],
+            )
+        except Exception as exc:
+            logger.debug("in-container diagnostic skipped: %r", exc)
         try:
             stop_container(cid)
         except Exception as exc:
