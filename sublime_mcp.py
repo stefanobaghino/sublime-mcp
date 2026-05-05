@@ -88,30 +88,52 @@ def _configure_bridge_logging():
     appends to it. When unset (e.g. running ST without the harness),
     the bridge falls back to stderr only.
     """
+    log_file = os.environ.get("SUBLIME_MCP_LOG_FILE", "").strip()
+    log_level = os.environ.get("SUBLIME_MCP_LOG_LEVEL", "INFO").upper()
+    # Diagnostic: write a sentinel showing what env we observed and
+    # whether the file open below succeeded. The harness can
+    # `docker exec cat /tmp/sublime-mcp-init.log` to triage cases
+    # where the bridge appears silent on the unified stream.
+    init_status = []
+    init_status.append("SUBLIME_MCP_LOG_FILE=%r" % log_file)
+    init_status.append("SUBLIME_MCP_LOG_LEVEL=%r" % log_level)
     root = logging.getLogger("sublime_mcp")
-    level = os.environ.get("SUBLIME_MCP_LOG_LEVEL", "INFO").upper()
-    root.setLevel(level)
+    root.setLevel(log_level)
     root.propagate = False
     if any(getattr(h, "_sublime_mcp_configured", False) for h in root.handlers):
+        init_status.append("already_configured=True")
+        _write_init_sentinel(init_status)
         return
     formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
     # UTC timestamps so harness + bridge lines sort and correlate in
     # one stream regardless of the host's TZ.
     import time as _time_mod
     formatter.converter = _time_mod.gmtime
-    log_file = os.environ.get("SUBLIME_MCP_LOG_FILE", "").strip()
     if log_file:
         try:
             stream = open(log_file, "a", buffering=1)  # line-buffered
-        except OSError:
+            init_status.append("stream=file(%s)" % log_file)
+        except OSError as exc:
             stream = sys.stderr  # mount missing or unwritable; fall back
+            init_status.append("stream=stderr (open failed: %r)" % exc)
     else:
         stream = sys.stderr
+        init_status.append("stream=stderr (no log file env)")
     handler = _FlushingStreamHandler(stream)
     handler.setFormatter(formatter)
     handler.addFilter(_ContextFilter())
     handler._sublime_mcp_configured = True
     root.addHandler(handler)
+    _write_init_sentinel(init_status)
+
+
+def _write_init_sentinel(items):
+    try:
+        with open("/tmp/sublime-mcp-init.log", "w") as fh:
+            for item in items:
+                fh.write(item + "\n")
+    except Exception:
+        pass
 
 
 def _faulthandler_dump_target():

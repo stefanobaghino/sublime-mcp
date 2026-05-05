@@ -706,14 +706,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = subprocess.run(
                 ["docker", "exec", cid, "sh", "-c",
-                 "ls -la %s 2>&1; echo '---content---'; cat %s 2>/dev/null | head -c 4096"
+                 "ls -la %s 2>&1; echo '---bridge-log-content---'; cat %s 2>/dev/null | head -c 4096; "
+                 "echo '---init-sentinel---'; cat /tmp/sublime-mcp-init.log 2>&1 | head -c 2048"
                  % (CONTAINER_LOG_FILE, CONTAINER_LOG_FILE)],
                 capture_output=True, text=True, timeout=5,
             )
             logger.info(
                 "in-container bridge log: rc=%d stdout=%r",
                 result.returncode,
-                result.stdout[:2000],
+                result.stdout[:3000],
             )
         except Exception as exc:
             logger.debug("in-container diagnostic skipped: %r", exc)
