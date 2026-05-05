@@ -58,7 +58,7 @@ The harness emits a single stderr stream that interleaves three components into 
 
 Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>`  `<message>`. Components: `[harness]` (host-side proxy), `[bridge]` (in-container plugin), `[st]` (anything else from the container's stdout/stderr — ST itself, plugin tracebacks, package_control noise).
 
-**Read channels.** Live: harness stderr — `claude mcp logs sublime-text` if your build of Claude Code surfaces it, otherwise whatever stderr surface the host platform exposes. Historical: `docker logs <cid>` replays the container's stdout/stderr from container start (bridge + st only — no `[harness]` lines, since the harness runs on the host).
+**Read channels.** Live: harness stderr — `claude mcp logs sublime-text` if your build of Claude Code surfaces it, otherwise whatever stderr surface the host platform exposes. The live stream interleaves all three components in chronological order. Historical `[bridge]`: `docker exec <cid> cat /tmp/sublime-mcp-bridge.log` — the bridge writes its formatted log lines to that in-container file, which `harness.py` tails into the live stream. `docker logs <cid>` does **not** include `[bridge]` events because ST self-daemonizes (`docker/entrypoint.sh:6-11`) and the plugin host's `sys.stderr` is detached from PID 1; on Docker Desktop in particular `docker logs` returns 0 lines on a healthy container that has been logging happily to the in-container file. Historical `[st]`: `docker logs <cid>` is the right surface for ST's own stdout/stderr (plugin tracebacks, `package_control` chatter, anything ST writes to fd 1/2 of the pre-detach process), but expect it to be sparse or empty given the daemon detach.
 
 **Levels.**
 
@@ -70,7 +70,7 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 **Troubleshooting workflow.**
 
 1. **Observe** the failure (timeout, error response, surprising scope).
-2. **Read backward** with `docker logs <cid>` to see the historical INFO trail leading up to the failure. Grep for the `req=<id>` of the failing request to isolate its path through the bridge.
+2. **Read backward** with `docker exec <cid> cat /tmp/sublime-mcp-bridge.log` to see the historical INFO trail of `[bridge]` events leading up to the failure. Grep for the `req=<id>` of the failing request to isolate its path through the bridge. Use `docker logs <cid>` only for the `[st]` channel (plugin tracebacks, etc.) — it does not contain `[bridge]` lines.
 3. **If the INFO trail isn't enough**, bump the bridge to DEBUG live — no restart needed: drive `exec_sublime_python` with `import logging; logging.getLogger("sublime_mcp.bridge").setLevel(logging.DEBUG)` and reproduce. Only works while the bridge is responsive (i.e. before a wedge); during an active wedge, bumping the level is moot — the diagnostic information is in the `faulthandler` dump that already fired at ERROR.
 4. **If the harness side is suspect**, restart with `--log-level DEBUG` (or set `SUBLIME_MCP_LOG_LEVEL=DEBUG` in the harness's environment); harness level is fixed per-session.
 
@@ -84,6 +84,16 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 | `[st]` Python traceback with no `[bridge]` lines after | bridge thread crashed on an uncaught plugin-host exception | restart the harness; consider filing the traceback as a bridge bug. |
 
 **Surfacing to the user.** Don't dump the whole trail — pull the ~30 lines around the failure boundary and grep for the failing `req=<id>`. The user's session already has the harness stderr; you're highlighting the relevant slice.
+
+## 1.2 Capturing ST's own console output (don't bother)
+
+When ST silently rejects a `.sublime-syntax` (parse-table-build failure — see #78), it writes the parse error to its console panel. That panel is *not* reachable from inside `exec_sublime_python` via any obvious path — every approach below has been verified empty in dogfooding sessions:
+
+- `window.find_output_panel("console")` returns `None` even when `window.panels()` lists `'console'`. `create_output_panel("console")` produces an empty View (size 0). Variants `'output.console'`, `'exec'`, `'Console'` are all empty.
+- Redirecting `sys.stdout` / `sys.stderr` over the parse-table-build window captures zero bytes.
+- `os.dup2(2, …)` over the same window also captures zero bytes.
+
+ST's loader writes its diagnostics through a path none of these reach. Don't burn a turn going through the standard-panel-API door. If your probe needs to know *why* a syntax was rejected, fall back to differential structural probing (write a known-good control alongside the suspect form, compare which one ST resolves) and surface the observation as "rejected at some layer beyond YAML parse" without naming the layer. See #79 for the open question on a usable capture path.
 
 ## 2. Decide whether this skill is the right call
 
