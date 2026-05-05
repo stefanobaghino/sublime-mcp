@@ -773,7 +773,11 @@ def scope_at_test(path, row, col):
     resource_path = _parse_syntax_test_header(view)
     assign_syntax_and_wait(view, resource_path)
     point = view.text_point(row, col)
-    resolved, scope = _read_syntax_and_scope(view, point)
+    # DIAGNOSTIC: temporarily reverted to inline reads to confirm the
+    # macOS run-tests hang is or is not caused by `_read_syntax_and_scope`.
+    syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    scope = view.scope_name(point).rstrip()
     if resolved != resource_path:
         _log.warning(
             "scope_at_test silent fallback: requested=%r resolved=%r",
@@ -815,7 +819,11 @@ def resolve_position(path, row, col, syntax_path=None):
     # against future inputs that resolve to a *smaller* row (negative
     # rows, CRLF edge cases) — those would be bugs, not overflows.
     overflow = real_row > row and not clamped
-    resolved, scope = _read_syntax_and_scope(view, point)
+    # DIAGNOSTIC: temporarily reverted to inline reads to confirm the
+    # macOS run-tests hang is or is not caused by `_read_syntax_and_scope`.
+    syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    scope = view.scope_name(point).rstrip()
     if syntax_path is not None and resolved != syntax_path:
         _log.warning(
             "resolve_position silent fallback: requested=%r resolved=%r",

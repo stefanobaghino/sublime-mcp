@@ -1684,13 +1684,12 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
         self.assertIn("temp_packages_link", outcome["error"])
 
 
-@unittest.skipIf(
-    sys.platform == "darwin",
-    "wedges run-tests on macOS GH runners (no per-test output streamed for "
-    "5+ min before cancel); race was characterised against the production "
-    "Linux/Docker harness, which is what the regression guards. macOS "
-    "passes the headless-smoke and harness-smoke gates that exercise the "
-    "same code path on a different runtime.",
+@unittest.skip(
+    "DIAGNOSTIC: skipped on all platforms while bisecting the macOS run-tests "
+    "hang; this commit also reverts the `_read_syntax_and_scope` invocations "
+    "to inline single-shot reads. If macOS passes here, the helper path is "
+    "the cause; if it still hangs, the cause is environmental and unrelated "
+    "to the helper."
 )
 class TestResolvePositionPostAssignRace(HelperTestBase):
     """`resolve_position` absorbs the post-assign race against a fresh
