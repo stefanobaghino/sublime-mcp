@@ -546,8 +546,15 @@ def _tail_bridge_log(cid: str, stop_event: threading.Event) -> None:
     stderr = sys.stderr
     proc = None
     try:
+        # `stdin=DEVNULL` is load-bearing: without it, Popen lets the
+        # subprocess inherit the harness's stdin, and `docker exec`'s
+        # session reader competes with `_stdin_reader` for the test
+        # client's JSON-RPC writes. (Dropping `-i` from the exec args
+        # is not enough — the subprocess still inherits the parent fd
+        # by default; the explicit DEVNULL is the guarantee.)
         proc = subprocess.Popen(
-            ["docker", "exec", "-i", cid, "tail", "-F", "-n", "+1", CONTAINER_LOG_FILE],
+            ["docker", "exec", cid, "tail", "-F", "-n", "+1", CONTAINER_LOG_FILE],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
