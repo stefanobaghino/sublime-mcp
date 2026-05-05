@@ -1746,9 +1746,15 @@ class TestResolvePositionPostAssignRace(HelperTestBase):
         # absorb the race.
         n = 10
         # One fixture per iteration so each call opens a fresh view —
-        # the race only fires on a view's first read after assign.
+        # the race only fires on a view's first read after assign. The
+        # fixture filename intentionally omits the `.smrace` extension
+        # the syntax declares: with that extension, ST's resource
+        # indexer would auto-assign the syntax on view-open and the
+        # explicit `assign_syntax` call inside `resolve_position` would
+        # land on an already-tokenised view, narrowing the race window
+        # below the test's signal threshold.
         fixture_paths = [
-            self._write_fixture("race_input_%d.smrace" % i, "x = 1\n")
+            self._write_fixture("race_input_%d" % i, "x = 1\n")
             for i in range(n)
         ]
         code = (
