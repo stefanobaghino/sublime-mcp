@@ -564,8 +564,14 @@ def _tail_bridge_log(path: str, stop_event: threading.Event) -> None:
     raised (container teardown). Polls the file rather than using
     `docker logs --follow` because ST's daemonization detaches its I/O
     from PID 1.
+
+    On exit, logs the byte count it forwarded and the file's final
+    size — divergence between the two surfaces a "tail saw nothing
+    but bridge did write" failure mode (and vice versa) instead of
+    leaving it indistinguishable from "bridge silently never logged".
     """
     stderr = sys.stderr
+    forwarded_bytes = 0
     try:
         f = open(path, "r")
     except OSError as exc:
@@ -577,6 +583,7 @@ def _tail_bridge_log(path: str, stop_event: threading.Event) -> None:
             if chunk:
                 stderr.write(chunk)
                 stderr.flush()
+                forwarded_bytes += len(chunk.encode("utf-8", "replace"))
             else:
                 time.sleep(0.1)
         # Drain anything written between the last poll and shutdown.
@@ -584,11 +591,35 @@ def _tail_bridge_log(path: str, stop_event: threading.Event) -> None:
         if chunk:
             stderr.write(chunk)
             stderr.flush()
+            forwarded_bytes += len(chunk.encode("utf-8", "replace"))
     finally:
         try:
             f.close()
         except OSError:
             pass
+        try:
+            final_size = os.path.getsize(path)
+        except OSError:
+            final_size = -1
+        logger.info(
+            "tail thread: forwarded_bytes=%d file_final_size=%d path=%s",
+            forwarded_bytes,
+            final_size,
+            path,
+        )
+        # If the file was non-trivial but we never forwarded anything,
+        # the polling read missed the writes — dump the file content
+        # for diagnosis. Bound at 16 KiB so a runaway write doesn't
+        # flood stderr.
+        if final_size > 0 and forwarded_bytes == 0:
+            try:
+                with open(path, "r") as f2:
+                    stderr.write("--- bridge log content (post-mortem) ---\n")
+                    stderr.write(f2.read(16 * 1024))
+                    stderr.write("\n--- end bridge log content ---\n")
+                    stderr.flush()
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------
