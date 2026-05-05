@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 import queue
 import shutil
@@ -37,11 +38,55 @@ CONTAINER_LICENSE_DIR = "/root/.config/sublime-text/Local"
 READINESS_TIMEOUT_S = 60.0
 SHUTDOWN_GRACE_S = 1.0
 PROXY_HTTP_TIMEOUT_S = 70.0  # exec snippets cap at 60s server-side
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+LOG_FORMAT = (
+    "%(asctime)s.%(msecs)03d  %(levelname)-7s  [%(component)s]  "
+    "req=%(req_id)s  %(message)s"
+)
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
 
 
-def log(msg: str) -> None:
-    """Print to stderr — stdout is the MCP transport."""
-    print("[sublime-mcp-harness] %s" % msg, file=sys.stderr, flush=True)
+# Per-request correlation id, set by `proxy_loop` before each http_post
+# and cleared in the finally. Read by `_ContextFilter` and stamped onto
+# every log record. The bridge has its own threadlocal in its own
+# process; the id flows across the boundary via the JSON-RPC `id`
+# field.
+_thread_local = threading.local()
+
+
+class _ContextFilter(logging.Filter):
+    """Stamp every record with `component` (from logger name) and `req_id`."""
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: D401
+        record.component = record.name.rsplit(".", 1)[-1]
+        record.req_id = getattr(_thread_local, "request_id", "-") or "-"
+        return True
+
+
+def _configure_logging(level: str) -> None:
+    """Idempotent root setup for `sublime_mcp.*` loggers.
+
+    Attaches a single stderr handler with the unified format. Safe to
+    call once per process; subsequent calls are no-ops aside from
+    level updates. Timestamps are UTC so the harness's lines and the
+    bridge's lines (emitted from the container, where TZ defaults to
+    UTC) sort and correlate in one stream regardless of host TZ.
+    """
+    root = logging.getLogger("sublime_mcp")
+    root.setLevel(level.upper())
+    root.propagate = False
+    if any(getattr(h, "_sublime_mcp_configured", False) for h in root.handlers):
+        return
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
+    formatter.converter = time.gmtime
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+    handler.addFilter(_ContextFilter())
+    handler._sublime_mcp_configured = True  # type: ignore[attr-defined]
+    root.addHandler(handler)
+
+
+logger = logging.getLogger("sublime_mcp.harness")
 
 
 # ---------------------------------------------------------------------
@@ -76,7 +121,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="PATH",
         help="Mount a Sublime Text license file into the container.",
     )
+    parser.add_argument(
+        "--log-level",
+        choices=LOG_LEVELS,
+        default=os.environ.get("SUBLIME_MCP_LOG_LEVEL", "INFO").upper(),
+        help="Logging level for harness + bridge (also $SUBLIME_MCP_LOG_LEVEL). "
+             "Default: %(default)s.",
+    )
     args = parser.parse_args(argv)
+    if args.log_level not in LOG_LEVELS:
+        parser.error("--log-level must be one of %s, got %r" % (LOG_LEVELS, args.log_level))
     for spec in args.mount:
         if ":" not in spec or spec.startswith(":") or spec.endswith(":"):
             parser.error("--mount expects HOST:CONTAINER, got %r" % spec)
@@ -163,12 +217,12 @@ def image_exists(tag: str) -> bool:
 
 
 def build_image(tag: str, context: Path) -> None:
-    log("building image %s (this can take a few minutes on first run)…" % tag)
+    logger.info("building image %s (this can take a few minutes on first run)…", tag)
     subprocess.run(
         ["docker", "build", "-t", tag, str(context)],
         check=True,
     )
-    log("image %s built" % tag)
+    logger.info("image %s built", tag)
 
 
 def ensure_image(tag: str, force: bool, context: Path) -> None:
@@ -187,13 +241,17 @@ def ensure_image(tag: str, force: bool, context: Path) -> None:
             finally:
                 shutil.rmtree(staged, ignore_errors=True)
         else:
-            log("reusing image %s" % tag)
+            logger.info("reusing image %s", tag)
+
+
+CONTAINER_LOG_FILE = "/tmp/sublime-mcp-bridge.log"
 
 
 def run_container(
     tag: str,
     mounts: list[str],
     license_file: str | None,
+    log_level: str = "INFO",
 ) -> str:
     args = [
         "docker", "run",
@@ -201,6 +259,8 @@ def run_container(
         "--rm",
         "--label", "sublime-mcp-harness=%d" % os.getpid(),
         "-p", "127.0.0.1:0:%d" % CONTAINER_PORT,
+        "-e", "SUBLIME_MCP_LOG_LEVEL=%s" % log_level,
+        "-e", "SUBLIME_MCP_LOG_FILE=%s" % CONTAINER_LOG_FILE,
     ]
     for spec in mounts:
         args += ["-v", spec]
@@ -238,6 +298,7 @@ def host_port(cid: str) -> int:
 
 def stop_container(cid: str) -> None:
     """Stop the container with a short grace, then kill if it lingers."""
+    logger.info("stopping container cid=%s grace=%.1fs", cid[:12], SHUTDOWN_GRACE_S)
     try:
         subprocess.run(
             ["docker", "stop", "--time", str(int(SHUTDOWN_GRACE_S)), cid],
@@ -281,13 +342,17 @@ def wait_for_ready(port: int, deadline: float) -> None:
     url = "http://127.0.0.1:%d/mcp" % port
     payload = json.dumps({"jsonrpc": "2.0", "id": "harness-ping", "method": "ping"}).encode("utf-8")
     last_err: Exception | None = None
+    started = time.monotonic()
     while time.monotonic() < deadline:
         try:
             status, _ = http_post(url, payload, timeout=2.0)
             if status == 200:
+                logger.info("MCP HTTP responded after %.2fs", time.monotonic() - started)
                 return
+            logger.debug("ping returned status=%d, retrying", status)
         except (urllib.error.URLError, ConnectionError, OSError) as exc:
             last_err = exc
+            logger.debug("ping failed: %r", exc)
         time.sleep(0.5)
     raise RuntimeError(
         "in-container MCP server did not respond within %.0fs: %r"
@@ -313,6 +378,7 @@ def wait_for_window(port: int, deadline: float) -> None:
     }
     payload = json.dumps(body).encode("utf-8")
     last_state = "(no response yet)"
+    started = time.monotonic()
     while time.monotonic() < deadline:
         try:
             status, raw = http_post(url, payload, timeout=5.0)
@@ -324,9 +390,11 @@ def wait_for_window(port: int, deadline: float) -> None:
                     output = (outcome.get("output") or "").strip()
                     last_state = "output=%r error=%r" % (output, outcome.get("error"))
                     if output.isdigit() and int(output) >= 1:
+                        logger.info("ST window opened after %.2fs", time.monotonic() - started)
                         return
         except (urllib.error.URLError, ConnectionError, OSError) as exc:
             last_state = repr(exc)
+        logger.debug("waiting for ST window: %s", last_state)
         time.sleep(0.5)
     raise RuntimeError(
         "Sublime Text never opened a window (last state: %s). "
@@ -358,6 +426,25 @@ def _stdin_reader(q: queue.Queue) -> None:
         q.put(line)
 
 
+def _peek_request(stripped: bytes) -> tuple[str | None, str | None]:
+    """Best-effort extraction of (request_id, method) from a JSON-RPC line.
+
+    Returns (None, None) for malformed input — the proxy still forwards
+    the bytes verbatim and lets the bridge respond with the structured
+    parse error.
+    """
+    try:
+        body = json.loads(stripped.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(body, dict):
+        return None, None
+    raw_id = body.get("id")
+    req_id = str(raw_id) if raw_id is not None else None
+    method = body.get("method")
+    return req_id, method if isinstance(method, str) else None
+
+
 def proxy_loop(port: int, stop_event: threading.Event) -> None:
     """Forward newline-delimited JSON-RPC between stdin/stdout and the container."""
     url = "http://127.0.0.1:%d/mcp" % port
@@ -375,29 +462,43 @@ def proxy_loop(port: int, stop_event: threading.Event) -> None:
         stripped = item.strip()
         if not stripped:
             continue
+        req_id, method = _peek_request(stripped)
+        _thread_local.request_id = req_id or "-"
         try:
-            status, raw = http_post(url, stripped, timeout=PROXY_HTTP_TIMEOUT_S)
-        except (urllib.error.URLError, ConnectionError, OSError) as exc:
-            err = _make_error_response(stripped, "container HTTP error: %r" % exc)
-            stdout.write(err + b"\n")
+            logger.debug("forwarding method=%s bytes=%d", method, len(stripped))
+            try:
+                status, raw = http_post(url, stripped, timeout=PROXY_HTTP_TIMEOUT_S)
+            except (urllib.error.URLError, ConnectionError, OSError) as exc:
+                logger.warning("container HTTP error: %r", exc)
+                err = _make_error_response(stripped, "container HTTP error: %r" % exc)
+                stdout.write(err + b"\n")
+                stdout.flush()
+                continue
+            if status == 202 or not raw:
+                # Notification → no body, no stdout write.
+                logger.debug("received status=%d (notification, no body)", status)
+                continue
+            if status != 200:
+                logger.warning(
+                    "container returned HTTP %d body=%r",
+                    status,
+                    raw[:1000].decode("utf-8", "replace"),
+                )
+                err = _make_error_response(
+                    stripped,
+                    "container returned HTTP %d: %s" % (status, raw[:200].decode("utf-8", "replace")),
+                )
+                stdout.write(err + b"\n")
+                stdout.flush()
+                continue
+            logger.debug("received status=%d bytes=%d", status, len(raw))
+            # Pass through verbatim. The plugin already speaks MCP JSON-RPC.
+            stdout.write(raw)
+            if not raw.endswith(b"\n"):
+                stdout.write(b"\n")
             stdout.flush()
-            continue
-        if status == 202 or not raw:
-            # Notification → no body, no stdout write.
-            continue
-        if status != 200:
-            err = _make_error_response(
-                stripped,
-                "container returned HTTP %d: %s" % (status, raw[:200].decode("utf-8", "replace")),
-            )
-            stdout.write(err + b"\n")
-            stdout.flush()
-            continue
-        # Pass through verbatim. The plugin already speaks MCP JSON-RPC.
-        stdout.write(raw)
-        if not raw.endswith(b"\n"):
-            stdout.write(b"\n")
-        stdout.flush()
+        finally:
+            _thread_local.request_id = "-"
 
 
 def _make_error_response(request_bytes: bytes, message: str) -> bytes:
@@ -418,35 +519,109 @@ def _make_error_response(request_bytes: bytes, message: str) -> bytes:
 
 
 # ---------------------------------------------------------------------
+# Bridge log tail
+
+
+def _tail_bridge_log(cid: str, stop_event: threading.Event) -> None:
+    """Tail the bridge log file from inside the container into harness stderr.
+
+    The bridge writes to `CONTAINER_LOG_FILE` inside the container —
+    not a bind-mounted host file. ST's plugin host can't reliably
+    write to a host bind-mounted file under Linux native Docker (the
+    plugin host appears to be running with restrictions that block
+    writes to files owned by other UIDs even at 0666 mode), so the
+    bridge owns the file lifecycle and the harness reads it via
+    `docker exec ... tail -F`.
+
+    Lines are pre-formatted by the bridge — pass them through verbatim
+    onto stderr. Multi-line `faulthandler` dumps (no `[bridge]` prefix)
+    inherit through the same passthrough so the wedged-thread stack
+    appears next to the ERROR line that triggered it.
+
+    Exits on `stop_event` set OR EOF from `tail` (container exited).
+    The `-n +1` flag streams the file from the start, so boot-time
+    bridge events make it through even if the tail thread starts
+    after they were emitted.
+    """
+    stderr = sys.stderr
+    proc = None
+    try:
+        # `stdin=DEVNULL` is load-bearing: without it, Popen lets the
+        # subprocess inherit the harness's stdin, and `docker exec`'s
+        # session reader competes with `_stdin_reader` for the test
+        # client's JSON-RPC writes. (Dropping `-i` from the exec args
+        # is not enough — the subprocess still inherits the parent fd
+        # by default; the explicit DEVNULL is the guarantee.)
+        proc = subprocess.Popen(
+            ["docker", "exec", cid, "tail", "-F", "-n", "+1", CONTAINER_LOG_FILE],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        logger.warning("tail thread: failed to spawn `docker exec tail`: %r", exc)
+        return
+    forwarded_bytes = 0
+    assert proc.stdout is not None
+    try:
+        while not stop_event.is_set():
+            line = proc.stdout.readline()
+            if not line:
+                logger.info("tail thread: docker exec tail returned EOF — container has exited")
+                return
+            stderr.write(line)
+            stderr.flush()
+            forwarded_bytes += len(line.encode("utf-8", "replace"))
+    finally:
+        logger.info("tail thread: forwarded_bytes=%d", forwarded_bytes)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+
+# ---------------------------------------------------------------------
 # Top-level
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    _configure_logging(args.log_level)
 
     ok, reason = docker_available()
     if not ok:
-        log("ERROR: %s. Install Docker Desktop or the Docker Engine, "
-            "ensure the daemon is running, and retry." % reason)
+        logger.error(
+            "docker unavailable: %s. Install Docker Desktop or the Docker Engine, "
+            "ensure the daemon is running, and retry.",
+            reason,
+        )
         return 2
 
     try:
         ctx = build_context_dir()
     except RuntimeError as exc:
-        log("ERROR: %s" % exc)
+        logger.error("%s", exc)
         return 2
 
     try:
         ensure_image(args.image_tag, args.rebuild, ctx)
     except subprocess.CalledProcessError as exc:
-        log("ERROR: docker build failed (exit %d)" % exc.returncode)
+        logger.error("docker build failed (exit %d)", exc.returncode)
         return exc.returncode or 1
 
     try:
-        cid = run_container(args.image_tag, args.mount, args.license_file)
+        cid = run_container(args.image_tag, args.mount, args.license_file, args.log_level)
     except subprocess.CalledProcessError as exc:
-        log("ERROR: docker run failed (exit %d): %s" % (exc.returncode, exc.stderr or ""))
+        logger.error("docker run failed (exit %d): %s", exc.returncode, exc.stderr or "")
         return exc.returncode or 1
+    logger.info("container started cid=%s", cid[:12])
 
     stop_event = threading.Event()
 
@@ -456,22 +631,37 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
+    tail_thread = threading.Thread(
+        target=_tail_bridge_log,
+        args=(cid, stop_event),
+        name="sublime-mcp-tail",
+        daemon=True,
+    )
+    tail_thread.start()
+
     try:
         port = host_port(cid)
+        logger.info("port mapping: 127.0.0.1:%d -> container:%d", port, CONTAINER_PORT)
         deadline = time.monotonic() + READINESS_TIMEOUT_S
         wait_for_ready(port, deadline)
         wait_for_window(port, deadline)
-        log("ready on 127.0.0.1:%d (container %s)" % (port, cid[:12]))
+        logger.info("ready on 127.0.0.1:%d (container %s)", port, cid[:12])
         proxy_loop(port, stop_event)
         return 0
     except Exception as exc:
-        log("ERROR: %s" % exc)
+        logger.error("%s", exc)
         return 1
     finally:
+        # Tell the tail thread to wind down BEFORE stopping the
+        # container so its final lines can drain through the docker
+        # exec pipe; signal handlers set `stop_event` themselves but
+        # the EOF-on-stdin path walks here without setting it.
+        stop_event.set()
+        tail_thread.join(timeout=2.0)
         try:
             stop_container(cid)
         except Exception as exc:
-            log("warning: cleanup of container %s failed: %r" % (cid[:12], exc))
+            logger.warning("cleanup of container %s failed: %r", cid[:12], exc)
 
 
 if __name__ == "__main__":

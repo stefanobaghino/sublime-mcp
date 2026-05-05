@@ -11,9 +11,12 @@ an open console. Do not expose the port beyond localhost.
 
 import ast
 import builtins as _builtins
+import faulthandler
 import io
 import json
+import logging
 import os
+import sys
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +36,122 @@ ENDPOINT = "/mcp"
 
 EXEC_TIMEOUT_SECONDS = 60.0
 OPEN_FILE_TIMEOUT_SECONDS = 5.0
+
+LOG_FORMAT = (
+    "%(asctime)s.%(msecs)03d  %(levelname)-7s  [%(component)s]  "
+    "req=%(req_id)s  %(message)s"
+)
+LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S"
+
+
+# Per-request correlation id. `MCPHandler.do_POST` sets this from the
+# JSON-RPC `id` before dispatching, and the worker thread spawned by
+# `_exec_on_worker` re-sets the parent's value on its own threadlocal
+# so log lines emitted from inside `exec`'d snippets and from helpers
+# they call carry the same id.
+_thread_local = threading.local()
+
+
+class _ContextFilter(logging.Filter):
+    """Stamp every record with `component` (from logger name) and `req_id`."""
+
+    def filter(self, record):  # noqa: D401
+        record.component = record.name.rsplit(".", 1)[-1]
+        record.req_id = getattr(_thread_local, "request_id", "-") or "-"
+        return True
+
+
+class _FlushingStreamHandler(logging.StreamHandler):
+    """Subclass that flushes after every record.
+
+    Sublime Text's plugin host can block-buffer stderr; without per-record
+    flush, lines arrive in 4096-byte chunks and the harness's tail thread
+    can't correlate them with harness-side logs in real time.
+    """
+
+    def emit(self, record):
+        super().emit(record)
+        try:
+            self.flush()
+        except Exception:  # pragma: no cover — flush errors swallowed
+            pass
+
+
+def _configure_bridge_logging():
+    """Idempotent setup for `sublime_mcp.*` loggers inside the plugin host.
+
+    Sublime Text self-daemonizes (entrypoint.sh:6-11), so its plugin
+    host's `sys.stderr` is detached from the container's PID 1 — log
+    lines written to stderr never reach `docker logs`. To get bridge
+    output back to a host-readable surface, the harness mounts a host
+    file at `$SUBLIME_MCP_LOG_FILE` inside the container; the bridge
+    appends to it. When unset (e.g. running ST without the harness),
+    the bridge falls back to stderr only.
+    """
+    log_file = os.environ.get("SUBLIME_MCP_LOG_FILE", "").strip()
+    log_level = os.environ.get("SUBLIME_MCP_LOG_LEVEL", "INFO").upper()
+    # Diagnostic: write a sentinel showing what env we observed and
+    # whether the file open below succeeded. The harness can
+    # `docker exec cat /tmp/sublime-mcp-init.log` to triage cases
+    # where the bridge appears silent on the unified stream.
+    init_status = []
+    init_status.append("SUBLIME_MCP_LOG_FILE=%r" % log_file)
+    init_status.append("SUBLIME_MCP_LOG_LEVEL=%r" % log_level)
+    root = logging.getLogger("sublime_mcp")
+    root.setLevel(log_level)
+    root.propagate = False
+    if any(getattr(h, "_sublime_mcp_configured", False) for h in root.handlers):
+        init_status.append("already_configured=True")
+        _write_init_sentinel(init_status)
+        return
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
+    # UTC timestamps so harness + bridge lines sort and correlate in
+    # one stream regardless of the host's TZ.
+    import time as _time_mod
+    formatter.converter = _time_mod.gmtime
+    if log_file:
+        try:
+            stream = open(log_file, "a", buffering=1)  # line-buffered
+            init_status.append("stream=file(%s)" % log_file)
+        except OSError as exc:
+            stream = sys.stderr  # mount missing or unwritable; fall back
+            init_status.append("stream=stderr (open failed: %r)" % exc)
+    else:
+        stream = sys.stderr
+        init_status.append("stream=stderr (no log file env)")
+    handler = _FlushingStreamHandler(stream)
+    handler.setFormatter(formatter)
+    handler.addFilter(_ContextFilter())
+    handler._sublime_mcp_configured = True
+    root.addHandler(handler)
+    _write_init_sentinel(init_status)
+
+
+def _write_init_sentinel(items):
+    try:
+        with open("/tmp/sublime-mcp-init.log", "w") as fh:
+            for item in items:
+                fh.write(item + "\n")
+    except Exception:
+        pass
+
+
+def _faulthandler_dump_target():
+    """Where the worker-timeout faulthandler dump goes.
+
+    Mirrors `_configure_bridge_logging` — prefer the host-mounted log
+    file when available, fall back to stderr.
+    """
+    log_file = os.environ.get("SUBLIME_MCP_LOG_FILE", "").strip()
+    if log_file:
+        try:
+            return open(log_file, "a", buffering=1)
+        except OSError:
+            pass
+    return sys.stderr
+
+
+logger = logging.getLogger("sublime_mcp.bridge")
 
 PROTOCOL_VERSION = "2025-11-25"
 SERVER_NAME = "sublime-mcp"
@@ -435,6 +554,7 @@ A Claude Code skill with workflow recipes for this tool is bundled at
 
 
 HELPERS_SOURCE = r'''
+import logging as _logging
 import os as _os
 import re as _re
 import time as _time
@@ -444,6 +564,8 @@ try:
 except ImportError:
     _sublime_api = None
 
+
+_log = _logging.getLogger("sublime_mcp.bridge")
 
 _SYNTAX_TEST_HEADER = _re.compile(r'SYNTAX TEST\s+"([^"]+)"')
 
@@ -552,6 +674,7 @@ def assign_syntax_and_wait(view, resource_path, timeout=2.0):
     # but it prevents stage 2 from exiting on the first populated scope
     # regardless of syntax.
     pre_scope = view.scope_name(0) or "text.plain "
+    _log.debug("assign_syntax_and_wait requested=%s pre_scope=%r", resource_path, pre_scope)
     view.assign_syntax(resource_path)
     stage1_deadline = _time.time() + timeout
     while _time.time() < stage1_deadline:
@@ -559,6 +682,11 @@ def assign_syntax_and_wait(view, resource_path, timeout=2.0):
             break
         _time.sleep(0.02)
     else:
+        _log.warning(
+            "assign_syntax_and_wait stage-1 timeout: syntax setting %r not applied in %ss",
+            resource_path,
+            timeout,
+        )
         raise TimeoutError(
             "assign_syntax_and_wait: syntax setting not applied in %ss" % timeout
         )
@@ -591,10 +719,17 @@ def scope_at_test(path, row, col):
     assign_syntax_and_wait(view, resource_path)
     point = view.text_point(row, col)
     syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    if resolved != resource_path:
+        _log.warning(
+            "scope_at_test silent fallback: requested=%r resolved=%r",
+            resource_path,
+            resolved,
+        )
     return {
         "scope": view.scope_name(point).rstrip(),
         "requested_syntax": resource_path,
-        "resolved_syntax": syntax.path if syntax is not None else None,
+        "resolved_syntax": resolved,
     }
 
 
@@ -627,6 +762,13 @@ def resolve_position(path, row, col, syntax_path=None):
     # rows, CRLF edge cases) — those would be bugs, not overflows.
     overflow = real_row > row and not clamped
     syntax = view.syntax()
+    resolved = syntax.path if syntax is not None else None
+    if syntax_path is not None and resolved != syntax_path:
+        _log.warning(
+            "resolve_position silent fallback: requested=%r resolved=%r",
+            syntax_path,
+            resolved,
+        )
     return {
         "point": point,
         "requested": [row, col],
@@ -635,7 +777,7 @@ def resolve_position(path, row, col, syntax_path=None):
         "overflow": overflow,
         "clamped": clamped,
         "requested_syntax": syntax_path,
-        "resolved_syntax": syntax.path if syntax is not None else None,
+        "resolved_syntax": resolved,
     }
 
 
@@ -681,6 +823,9 @@ def run_on_main(callable_, timeout=2.0):
             done.set()
     sublime.set_timeout(runner, 0)
     if not done.wait(timeout):
+        # Eager warning: surfaces main-thread wedge *during* the wedge
+        # rather than only when _exec_on_worker hits its own 60s ceiling.
+        _log.warning("run_on_main: callable did not complete within %ss", timeout)
         raise TimeoutError(
             "run_on_main: callable did not complete within %ss" % timeout
         )
@@ -913,6 +1058,7 @@ def _sweep_stale_temp_dirs():
     except OSError:
         return
     now = _time.time()
+    swept = 0
     for name in entries:
         if not (name.startswith(_TEMP_DIR_PREFIX) and name.endswith(_TEMP_DIR_SUFFIX)):
             continue
@@ -925,6 +1071,10 @@ def _sweep_stale_temp_dirs():
             continue
         import shutil as _shutil
         _shutil.rmtree(full, ignore_errors=True)
+        _log.info("swept stale temp_dir name=%s age=%.1fs", name, age)
+        swept += 1
+    if swept:
+        _log.debug("_sweep_stale_temp_dirs swept count=%d", swept)
 
 
 def _new_temp_dir():
@@ -947,6 +1097,7 @@ def _sweep_stale_temp_packages():
     except OSError:
         return
     now = _time.time()
+    swept = 0
     for name in entries:
         if not (name.startswith(_TEMP_DIR_PREFIX) and name.endswith(_TEMP_DIR_SUFFIX)):
             continue
@@ -963,6 +1114,11 @@ def _sweep_stale_temp_packages():
             _os.unlink(full)
         except OSError:
             pass
+        else:
+            _log.info("swept stale temp_packages_link name=%s age=%.1fs", name, age)
+            swept += 1
+    if swept:
+        _log.debug("_sweep_stale_temp_packages swept count=%d", swept)
 
 
 def temp_packages_link(filesystem_path):
@@ -1130,8 +1286,10 @@ def _compile_snippet(code):
     try:
         tree = ast.parse(code, mode="exec")
     except SyntaxError:
+        logger.debug("_compile_snippet: SyntaxError, deferring to original compile")
         return compile(code, "<sublime-mcp-snippet>", "exec")
     if not tree.body or not isinstance(tree.body[-1], ast.Expr):
+        logger.debug("_compile_snippet: no trailing expression, no auto-lift")
         return compile(tree, "<sublime-mcp-snippet>", "exec")
     has_explicit_underscore = any(
         isinstance(stmt, ast.Assign)
@@ -1139,7 +1297,9 @@ def _compile_snippet(code):
         for stmt in tree.body
     )
     if has_explicit_underscore:
+        logger.debug("_compile_snippet: explicit _ assignment, no auto-lift")
         return compile(tree, "<sublime-mcp-snippet>", "exec")
+    logger.debug("_compile_snippet: auto-lifted trailing expression into _")
     last = tree.body[-1]
     tree.body[-1] = ast.Assign(
         targets=[ast.Name(id="_", ctx=ast.Store())],
@@ -1171,7 +1331,14 @@ def _exec_on_worker(code):
         "st_channel": sublime.channel(),
     }
 
+    # Capture the parent's request id so the worker thread's log lines
+    # — and any helper logging triggered from inside the snippet — carry
+    # the same correlation id as the do_POST that scheduled them.
+    parent_req_id = getattr(_thread_local, "request_id", "-") or "-"
+
     def run():
+        _thread_local.request_id = parent_req_id
+        logger.info("worker entered")
         buf_out = io.StringIO()
         # Override `print` in the snippet's namespace rather than
         # redirecting sys.stdout/sys.stderr globally. The global redirect
@@ -1192,10 +1359,12 @@ def _exec_on_worker(code):
             exec(_HELPERS_CODE, namespace)
         except Exception:
             result["error"] = "helper init failed:\n" + traceback.format_exc()
+            logger.error("helper init failed", exc_info=True)
             done.set()
             return
         try:
             compiled = _compile_snippet(code)
+            logger.info("snippet exec begin code_bytes=%d", len(code))
             exec(compiled, namespace)
             if "_" in namespace and namespace["_"] is not None:
                 try:
@@ -1206,6 +1375,11 @@ def _exec_on_worker(code):
             result["error"] = traceback.format_exc()
         finally:
             result["output"] = buf_out.getvalue()
+            logger.info(
+                "snippet exec done error=%s output_bytes=%d",
+                "yes" if result["error"] else "no",
+                len(result["output"]),
+            )
             done.set()
 
     # Dispatch on a dedicated daemon thread rather than
@@ -1218,12 +1392,29 @@ def _exec_on_worker(code):
     # can still use sublime.set_timeout(lambda: ..., 0) inside the snippet
     # and poll. `daemon=True` so a runaway snippet doesn't block unload.
     worker = threading.Thread(target=run, name="sublime-mcp-exec", daemon=True)
+    logger.info("starting worker code_bytes=%d", len(code))
     worker.start()
     if not done.wait(EXEC_TIMEOUT_SECONDS):
         # Reuse the pre-populated `st_version` / `st_channel` from the
         # initial dict so the envelope shape stays uniform across the
         # success and timeout paths.
         result["error"] = "exec timed out after %ss" % EXEC_TIMEOUT_SECONDS
+        logger.error(
+            "worker did not complete in %ss; worker thread is_alive=%s",
+            EXEC_TIMEOUT_SECONDS,
+            worker.is_alive(),
+        )
+        # Best-effort all-thread Python stack dump. When the snippet is
+        # wedged on `run_on_main` waiting for ST's main thread, the dump
+        # identifies which thread is blocked and on what — the canonical
+        # #73 diagnostic. Wrapped so a faulthandler error doesn't mask
+        # the timeout log line above.
+        try:
+            target = _faulthandler_dump_target()
+            faulthandler.dump_traceback(file=target, all_threads=True)
+            target.flush()
+        except Exception:
+            logger.warning("faulthandler.dump_traceback failed", exc_info=True)
         return result
     return result
 
@@ -1318,9 +1509,15 @@ class MCPHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
+        logger.debug("do_POST received bytes=%d path=%s", length, self.path)
         try:
             message = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception as exc:
+            logger.warning(
+                "do_POST parse error: %s; first 64 bytes hex=%s",
+                exc,
+                raw[:64].hex(),
+            )
             self._send_json(400, {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -1328,21 +1525,47 @@ class MCPHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if isinstance(message, list):
-            responses = [r for r in (_dispatch(m) for m in message) if r is not None]
-            if not responses:
+        # Stamp request-id on the threadlocal so every log line emitted
+        # by `_dispatch` and the helpers it calls carries it. Cleared in
+        # the `finally` to avoid bleeding into the next handler thread.
+        _thread_local.request_id = self._extract_request_id(message)
+        try:
+            if isinstance(message, list):
+                responses = [r for r in (_dispatch(m) for m in message) if r is not None]
+                logger.debug(
+                    "do_POST dispatched batch=%d responses=%d",
+                    len(message),
+                    len(responses),
+                )
+                if not responses:
+                    self.send_response(202)
+                    self.end_headers()
+                    return
+                self._send_json(200, responses)
+                return
+
+            response = _dispatch(message)
+            kind = "notification" if response is None else (
+                "error" if "error" in response else "result"
+            )
+            logger.debug("do_POST dispatched method=%s kind=%s", message.get("method"), kind)
+            if response is None:
                 self.send_response(202)
                 self.end_headers()
                 return
-            self._send_json(200, responses)
-            return
+            self._send_json(200, response)
+        finally:
+            _thread_local.request_id = "-"
 
-        response = _dispatch(message)
-        if response is None:
-            self.send_response(202)
-            self.end_headers()
-            return
-        self._send_json(200, response)
+    @staticmethod
+    def _extract_request_id(message):
+        if isinstance(message, dict):
+            raw_id = message.get("id")
+            return str(raw_id) if raw_id is not None else "-"
+        if isinstance(message, list) and message:
+            raw_id = message[0].get("id") if isinstance(message[0], dict) else None
+            return str(raw_id) if raw_id is not None else "-"
+        return "-"
 
     def do_GET(self):
         self._send_json(405, {"error": "this server does not serve a GET stream"})
@@ -1369,12 +1592,13 @@ _thread = None
 
 def plugin_loaded():
     global _server, _thread
+    _configure_bridge_logging()
     if _server is not None:
         return
     try:
         _server = ThreadingHTTPServer((HOST, PORT), MCPHandler)
     except OSError as exc:
-        print("[sublime-mcp] failed to bind %s:%d — %s" % (HOST, PORT, exc))
+        logger.error("failed to bind %s:%d — %s", HOST, PORT, exc)
         _server = None
         return
     _thread = threading.Thread(
@@ -1383,7 +1607,7 @@ def plugin_loaded():
         daemon=True,
     )
     _thread.start()
-    print("[sublime-mcp] listening on %s:%d%s" % (HOST, PORT, ENDPOINT))
+    logger.info("listening on %s:%d%s", HOST, PORT, ENDPOINT)
 
 
 def plugin_unloaded():
@@ -1395,4 +1619,4 @@ def plugin_unloaded():
         finally:
             _server = None
             _thread = None
-            print("[sublime-mcp] stopped")
+            logger.info("stopped")
