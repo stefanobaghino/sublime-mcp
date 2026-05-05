@@ -729,13 +729,44 @@ def _parse_syntax_test_header(view):
     return m.group(1)
 
 
+_PLAIN_TEXT_URI = "Packages/Text/Plain text.tmLanguage"
+
+
+def _read_syntax_and_scope(view, point, deadline_s=0.2):
+    # Producer-side retry to absorb the post-assign race documented at #70.
+    # Two observed shapes after `assign_syntax_and_wait` returns:
+    #   (a) `view.syntax()` is None while `view.scope_name(point)` already
+    #       returns a non-plain scope chain — the strict
+    #       `resolved == requested` assertion in SKILL.md §4 spuriously
+    #       fails, callers discard a good answer.
+    #   (b) `view.syntax()` is the requested syntax while
+    #       `view.scope_name(point)` still returns "text.plain" —
+    #       worse, the strict assertion spuriously passes and callers
+    #       treat plain text as ground truth.
+    # Both shapes heal within tens of ms on observed traces; we converge
+    # by retrying until both reads agree on "real syntax / real scope" or
+    # both agree on "plain", whichever way they latch. Persistent
+    # disagreement past `deadline_s` returns the last reads — the caller
+    # gets the same envelope shape it always got, and the residual is the
+    # silent-parse-table-build-failure signal #78 will own.
+    deadline = _time.time() + deadline_s
+    while True:
+        syntax = view.syntax()
+        resolved = syntax.path if syntax is not None else None
+        scope = view.scope_name(point).rstrip()
+        syntax_looks_real = resolved is not None and resolved != _PLAIN_TEXT_URI
+        scope_looks_real = bool(scope) and scope != "text.plain"
+        if syntax_looks_real == scope_looks_real or _time.time() >= deadline:
+            return resolved, scope
+        _time.sleep(0.02)
+
+
 def scope_at_test(path, row, col):
     view = open_view(path)
     resource_path = _parse_syntax_test_header(view)
     assign_syntax_and_wait(view, resource_path)
     point = view.text_point(row, col)
-    syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
+    resolved, scope = _read_syntax_and_scope(view, point)
     if resolved != resource_path:
         _log.warning(
             "scope_at_test silent fallback: requested=%r resolved=%r",
@@ -743,7 +774,7 @@ def scope_at_test(path, row, col):
             resolved,
         )
     return {
-        "scope": view.scope_name(point).rstrip(),
+        "scope": scope,
         "requested_syntax": resource_path,
         "resolved_syntax": resolved,
     }
@@ -777,8 +808,7 @@ def resolve_position(path, row, col, syntax_path=None):
     # against future inputs that resolve to a *smaller* row (negative
     # rows, CRLF edge cases) — those would be bugs, not overflows.
     overflow = real_row > row and not clamped
-    syntax = view.syntax()
-    resolved = syntax.path if syntax is not None else None
+    resolved, scope = _read_syntax_and_scope(view, point)
     if syntax_path is not None and resolved != syntax_path:
         _log.warning(
             "resolve_position silent fallback: requested=%r resolved=%r",
@@ -789,7 +819,7 @@ def resolve_position(path, row, col, syntax_path=None):
         "point": point,
         "requested": [row, col],
         "actual": [real_row, real_col],
-        "scope": view.scope_name(point).rstrip(),
+        "scope": scope,
         "overflow": overflow,
         "clamped": clamped,
         "requested_syntax": syntax_path,

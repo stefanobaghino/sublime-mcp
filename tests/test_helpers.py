@@ -1684,6 +1684,111 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
         self.assertIn("temp_packages_link", outcome["error"])
 
 
+class TestResolvePositionPostAssignRace(HelperTestBase):
+    """`resolve_position` absorbs the post-assign race against a fresh
+    synthetic syntax (#70). Two race shapes are observable on the first
+    read of a freshly-assigned syntax: `view.syntax()` lagging
+    `view.scope_name(...)` (OP shape — strict equality assertion in
+    SKILL.md §4 spuriously fails) and `view.scope_name(point)` lagging
+    `view.syntax()` (symmetric shape — strict assertion spuriously
+    passes, callers treat `text.plain` as ground truth). Both heal
+    within tens of ms; the producer-side retry collapses both before
+    returning.
+
+    This regression test loops `resolve_position` against a fresh
+    `temp_packages_link`-installed syntax, opens a fresh view per call,
+    and asserts every envelope is converged: scope and resolved_syntax
+    agree on "real" or "plain". Without the producer-side retry the
+    col-0 first-read race tends to surface in at least one iteration.
+    """
+
+    SYNTAX_CONTENT = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: SublimeMcpRaceProbe\n"
+        "scope: source.smrace\n"
+        "file_extensions: [smrace]\n"
+        "version: 2\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: 'x'\n"
+        "      scope: keyword.smrace\n"
+    )
+
+    SYNTAX_BASENAME = "RaceProbe.sublime-syntax"
+
+    def setUp(self):
+        self._defensive_link_sweep()
+        self.target_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_race_")
+        self.addCleanup(shutil.rmtree, self.target_dir, ignore_errors=True)
+        self.syntax_path = os.path.join(self.target_dir, self.SYNTAX_BASENAME)
+        with open(self.syntax_path, "w") as f:
+            f.write(self.SYNTAX_CONTENT)
+
+    def _defensive_link_sweep(self):
+        packages_root = sublime.packages_path()
+        for name in os.listdir(packages_root):
+            if not (name.startswith("__sublime_mcp_temp_") and name.endswith("__")):
+                continue
+            full = os.path.join(packages_root, name)
+            if os.path.islink(full):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+
+    def test_resolve_position_converges_on_first_read(self):
+        # N=10 iterations, each opens a fresh fixture view and reads col
+        # 0 of "x ...". Each call goes through the post-assign race
+        # window. Assertion: every envelope is converged — scope is
+        # non-plain AND resolved_syntax matches requested_syntax, OR
+        # both are plain. Divergent envelopes indicate the retry didn't
+        # absorb the race.
+        n = 10
+        # One fixture per iteration so each call opens a fresh view —
+        # the race only fires on a view's first read after assign.
+        fixture_paths = [
+            self._write_fixture("race_input_%d.smrace" % i, "x = 1\n")
+            for i in range(n)
+        ]
+        code = (
+            "import json\n"
+            "fixtures = %r\n"
+            "name = temp_packages_link(%r)\n"
+            "try:\n"
+            "    rs = []\n"
+            "    for p in fixtures:\n"
+            "        r = resolve_position(p, 0, 0, syntax_path=%r)\n"
+            "        rs.append(r)\n"
+            "    print(json.dumps(rs))\n"
+            "finally:\n"
+            "    release_packages_link(name)\n"
+        ) % (fixture_paths, self.syntax_path, self.syntax_path)
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        envelopes = json.loads(outcome["output"])
+        self.assertEqual(len(envelopes), n)
+        for r in envelopes:
+            scope = r["scope"]
+            requested = r["requested_syntax"]
+            resolved = r["resolved_syntax"]
+            scope_real = bool(scope) and scope != "text.plain"
+            syntax_real = resolved is not None and resolved == requested
+            self.assertEqual(
+                scope_real, syntax_real,
+                "divergent envelope (post-assign race not absorbed): %r" % r,
+            )
+            # The synthetic syntax matches `x` → keyword.smrace under
+            # source.smrace. With the race absorbed, the converged
+            # state is the "real" branch.
+            self.assertTrue(
+                scope_real,
+                "expected real scope after convergence: %r" % r,
+            )
+            self.assertIn("source.smrace", scope)
+
+
 class TestPerCallTimeout(HelperTestBase):
     """Per-call `timeout_seconds` override on `exec_sublime_python` (#62).
 
