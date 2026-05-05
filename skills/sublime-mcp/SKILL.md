@@ -188,6 +188,8 @@ Branch on `state` for the assertion-run outcome:
 
 When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. The reachable causes are: resource not yet indexed, path outside `sublime.packages_path()` (symlink it in first — see "Confirm which syntax ST assigned (and handle repo-local syntaxes)" below), and the private `sublime_api.run_syntax_test` missing on this ST build. For ground-truth questions that don't need the assertion runner, fall back to `scope_at` / `scope_at_test` or `resolve_position`.
 
+The `^` alignment rule that defines what each assertion line targets is documented under *Probe a synthetic case inline* below.
+
 ### Probe a synthetic case inline
 
 For "what does ST do on this case?" probes against a syntax that's *already reachable to ST* — bundled, or linked into `Packages/` via `temp_packages_link` — `run_inline_syntax_test(content, name)` owns the file-write, indexing wait, runner call, and cleanup. The header inside `content` selects the syntax under test.
@@ -203,6 +205,8 @@ print(r["state"], r["summary"])
 ```
 
 Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one extra state `"inconclusive"` when ST never indexes the temp resource within the wait budget. The probe's temp dir is removed on every code path (within-call `try/finally`); a cross-call sweep at the start of each call cleans up SIGKILL-orphaned dirs older than 60 s.
+
+**Assertion-line `^` alignment.** Each `^` in an assertion line tests the column it sits in on the assertion line — the same column on the content line directly above. The leading columns are taken up by the comment marker (`#` ⇒ col 0 unreachable; `//` ⇒ cols 0–1 unreachable, with the conventional trailing space pushing the testable region to col 3+). Probes targeting those leading columns of the content line cannot be expressed through `^`. Pad the content with leading spaces if you need to test the leading region, or prefer the single-char `# SYNTAX TEST` header that maximises the reachable range. For "scope at point" probes that don't need assertion-runner output, prefer `scope_at` / `scope_at_test` / `resolve_position` — they accept any column directly.
 
 This helper writes only the *test file*. When the syntax under test is also synthetic, pair `temp_packages_link` (own the syntax) with `resolve_position` / `scope_at` (sample the input) — see the next recipe.
 
