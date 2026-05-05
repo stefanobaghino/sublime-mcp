@@ -1044,6 +1044,10 @@ def _wait_for_resource(resource_path, timeout=3.0):
 _TEMP_DIR_PREFIX = "__sublime_mcp_temp_"
 _TEMP_DIR_SUFFIX = "__"
 _TEMP_DIR_MAX_AGE_SECONDS = 60.0
+# Internal cap on temp_packages_link's indexing-wait budget. Half the
+# worker exec ceiling so a generous caller-supplied value still leaves
+# headroom for one retry within the same exec.
+_TEMP_LINK_WAIT_CAP_SECONDS = 30.0
 
 
 def _sweep_stale_temp_dirs():
@@ -1121,43 +1125,104 @@ def _sweep_stale_temp_packages():
         _log.debug("_sweep_stale_temp_packages swept count=%d", swept)
 
 
-def temp_packages_link(filesystem_path):
+def temp_packages_link(filesystem_path, wait_timeout=3.0):
     # Synthesise a Packages/__sublime_mcp_temp_<nonce>__ symlink whose
     # target is the parent dir of `filesystem_path` (or the path itself
     # if it's a directory). Wait for ST's resource indexer to surface
-    # the sentinel resource. Returns the synthesised package name —
-    # callers build "Packages/<name>/<basename>" URIs against the
-    # existing helpers (assign_syntax_and_wait, resolve_position) and
-    # call release_packages_link(name) when done. Two-layer cleanup
+    # at least one file under the link before returning. Returns the
+    # synthesised package name — callers build
+    # "Packages/<name>/<basename>" URIs against the existing helpers
+    # (assign_syntax_and_wait, resolve_position) and call
+    # release_packages_link(name) when done. Two-layer cleanup
     # (mirrors run_inline_syntax_test): caller-managed within-call,
     # _sweep_stale_temp_packages at the head for SIGKILL paths.
+    #
+    # Contract: does not return until ST has indexed at least one file
+    # under the new link. Raises RuntimeError on degenerate input
+    # (path missing, empty directory, special file) or on indexing-
+    # wait timeout. `wait_timeout` is bounded internally at 30s so a
+    # generous caller-supplied value can't consume more than half the
+    # worker exec ceiling — leaves headroom for one retry within the
+    # same exec.
     import uuid as _uuid
+    effective_timeout = min(
+        max(0.0, float(wait_timeout)), _TEMP_LINK_WAIT_CAP_SECONDS
+    )
     abs_path = _os.path.abspath(filesystem_path)
+    _log.debug("temp_packages_link target=%r", abs_path)
     if _os.path.isdir(abs_path):
         target_dir = abs_path
+        try:
+            entries = sorted(_os.listdir(target_dir))
+        except OSError as exc:
+            _log.warning(
+                "temp_packages_link: cannot list target dir %r: %s",
+                target_dir, exc,
+            )
+            raise RuntimeError(
+                "temp_packages_link: cannot list target dir %r: %s"
+                % (target_dir, exc)
+            )
         sentinel_basename = None
-    else:
+        for entry in entries:
+            if entry.startswith("."):
+                continue
+            if _os.path.isfile(_os.path.join(target_dir, entry)):
+                sentinel_basename = entry
+                break
+        if sentinel_basename is None:
+            _log.warning(
+                "temp_packages_link: target dir %r has no files to index "
+                "(entries=%d)",
+                target_dir, len(entries),
+            )
+            raise RuntimeError(
+                "temp_packages_link: target dir %r has no files to index"
+                % target_dir
+            )
+    elif _os.path.isfile(abs_path):
         target_dir = _os.path.dirname(abs_path)
         sentinel_basename = _os.path.basename(abs_path)
-    if not _os.path.isdir(target_dir):
+    elif not _os.path.exists(abs_path):
+        _log.warning("temp_packages_link: %r does not exist", abs_path)
         raise RuntimeError(
-            "temp_packages_link: target dir %r does not exist" % target_dir
+            "temp_packages_link: %r does not exist" % abs_path
+        )
+    else:
+        _log.warning(
+            "temp_packages_link: %r is not a file or directory", abs_path,
+        )
+        raise RuntimeError(
+            "temp_packages_link: %r is not a file or directory" % abs_path
         )
     _sweep_stale_temp_packages()
     nonce = _uuid.uuid4().hex[:12]
     name = "%s%s%s" % (_TEMP_DIR_PREFIX, nonce, _TEMP_DIR_SUFFIX)
     link_path = _os.path.join(sublime.packages_path(), name)
+    _log.info(
+        "temp_packages_link: creating link name=%s target=%s sentinel=%s "
+        "wait_timeout=%.1fs",
+        name, target_dir, sentinel_basename, effective_timeout,
+    )
     _os.symlink(target_dir, link_path)
-    if sentinel_basename is not None:
-        sentinel_resource = "Packages/%s/%s" % (name, sentinel_basename)
-        if not _wait_for_resource(sentinel_resource):
-            try:
-                _os.unlink(link_path)
-            finally:
-                raise RuntimeError(
-                    "temp_packages_link: ST did not index %s within the wait budget"
-                    % sentinel_resource
-                )
+    sentinel_resource = "Packages/%s/%s" % (name, sentinel_basename)
+    started = _time.time()
+    if not _wait_for_resource(sentinel_resource, timeout=effective_timeout):
+        try:
+            _os.unlink(link_path)
+        finally:
+            _log.warning(
+                "temp_packages_link: ST did not index %s within %.1fs",
+                sentinel_resource, effective_timeout,
+            )
+            raise RuntimeError(
+                "temp_packages_link: ST did not index %s within %.1fs"
+                % (sentinel_resource, effective_timeout)
+            )
+    _log.info(
+        "temp_packages_link: link ready name=%s sentinel=%s elapsed=%.2fs",
+        name, sentinel_basename, _time.time() - started,
+    )
     return name
 
 

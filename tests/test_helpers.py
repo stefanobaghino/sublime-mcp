@@ -1241,6 +1241,77 @@ class TestTempPackagesLink(HelperTestBase):
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "ok")
 
+    def test_raises_on_missing_file_under_existing_parent(self):
+        # Parent dir exists, file under it doesn't. Helper must catch
+        # this upfront rather than waiting through `_wait_for_resource`
+        # for a sentinel that can't appear. Error message names the
+        # missing file, not the parent.
+        missing = os.path.join(self.target_dir, "does_not_exist.sublime-syntax")
+        code = (
+            "_ = temp_packages_link(%r)\n"
+            "print(_)\n"
+        ) % missing
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        self.assertIn("does not exist", outcome["error"])
+        self.assertIn("does_not_exist.sublime-syntax", outcome["error"])
+
+    def test_raises_on_empty_directory(self):
+        # An empty directory has nothing to index; without an upfront
+        # check, the helper would create a useless symlink and wait
+        # the full budget for a sentinel it can't pick.
+        empty_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_empty_")
+        self.addCleanup(shutil.rmtree, empty_dir, ignore_errors=True)
+        code = (
+            "_ = temp_packages_link(%r)\n"
+            "print(_)\n"
+        ) % empty_dir
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        self.assertIn("no files to index", outcome["error"])
+
+    def test_directory_input_waits_for_first_file(self):
+        # Directory form must verify ST has indexed at least one file
+        # under the link before returning — the silent-fallback shape
+        # on #67 was the directory branch returning success without
+        # any post-condition. The pre-existing syntax file under
+        # target_dir is the sentinel; assert it surfaces in
+        # `find_resources` immediately after the helper returns.
+        code = (
+            "name = temp_packages_link(%r)\n"
+            "import json\n"
+            "_ = json.dumps([name, find_resources('Probe.sublime-syntax')])\n"
+            "print(_)\n"
+        ) % self.target_dir
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        name, resources = json.loads(outcome["output"].strip())
+        self.addCleanup(self._release, name)
+        expected = "Packages/%s/%s" % (name, self.syntax_basename)
+        self.assertIn(expected, resources)
+
+    def test_wait_timeout_threaded_through(self):
+        # `wait_timeout=0.0` collapses the wait window to zero so the
+        # helper raises before ST can index, regardless of how fast
+        # the indexer actually is. Verifies the new parameter is
+        # forwarded to `_wait_for_resource` rather than ignored, and
+        # that the surfaced timeout in the error message reflects the
+        # caller's value.
+        code = (
+            "_ = temp_packages_link(%r, wait_timeout=0.0)\n"
+            "print(_)\n"
+        ) % self.syntax_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("did not index", outcome["error"])
+        self.assertIn("0.0s", outcome["error"])
+
     def test_stale_link_swept_on_next_call(self):
         # Plant a stale temp symlink with mtime 90 s in the past, then
         # call temp_packages_link; the head-of-call sweep should
