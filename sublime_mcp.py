@@ -732,7 +732,7 @@ def _parse_syntax_test_header(view):
 _PLAIN_TEXT_URI = "Packages/Text/Plain text.tmLanguage"
 
 
-def _read_syntax_and_scope(view, point, deadline_s=0.2):
+def _read_syntax_and_scope(view, point, deadline_s=1.0):
     # Producer-side retry to absorb the post-assign race documented at #70.
     # Two observed shapes after `assign_syntax_and_wait` returns:
     #   (a) `view.syntax()` is None while `view.scope_name(point)` already
@@ -743,12 +743,17 @@ def _read_syntax_and_scope(view, point, deadline_s=0.2):
     #       `view.scope_name(point)` still returns "text.plain" —
     #       worse, the strict assertion spuriously passes and callers
     #       treat plain text as ground truth.
-    # Both shapes heal within tens of ms on observed traces; we converge
-    # by retrying until both reads agree on "real syntax / real scope" or
-    # both agree on "plain", whichever way they latch. Persistent
-    # disagreement past `deadline_s` returns the last reads — the caller
-    # gets the same envelope shape it always got, and the residual is the
-    # silent-parse-table-build-failure signal #78 will own.
+    # We converge by retrying until both reads agree on "real syntax /
+    # real scope" or both agree on "plain", whichever way they latch.
+    # Persistent disagreement past `deadline_s` returns the last reads —
+    # the caller gets the same envelope shape it always got, and the
+    # residual is the silent-parse-table-build-failure signal #78 will
+    # own. Budget sized to 1.0 s: the OP-direction race (`view.syntax()`
+    # lagging) was observed to take noticeably longer than tokenisation
+    # on Linux CI; matches `assign_syntax_and_wait`'s 2 s stage-1 ceiling
+    # for the same producer-side latching while keeping the helper from
+    # extending a `resolve_position` call beyond half that on the slow
+    # path.
     deadline = _time.time() + deadline_s
     while True:
         syntax = view.syntax()
