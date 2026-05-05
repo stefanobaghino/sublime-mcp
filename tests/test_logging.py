@@ -319,11 +319,154 @@ class TestUnifiedLogging(unittest.TestCase):
         )
 
 
+@unittest.skipIf(
+    _RUNNING_IN_SUBLIME,
+    "test_logging.py drives a host-side Docker harness; not applicable inside ST plugin host",
+)
+class TestHealthCheck(unittest.TestCase):
+    """Coverage for the `health_check` MCP tool surface (#73 part 1).
+
+    `health_check` runs entirely on the HTTP request thread — its purpose
+    is to return within ~2.5s even when ST's main thread is wedged. The
+    wedged-main test below installs a ~6s sleep on ST's main thread via a
+    fast-returning snippet, then calls `health_check` and asserts the
+    response arrives in well under the would-be 60s exec ceiling.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not _docker_available():
+            raise unittest.SkipTest("docker not available")
+
+    def test_tools_list_includes_health_check(self) -> None:
+        proc = _spawn_harness()
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {},
+            })
+            resp = _recv(proc, timeout_s=DEFAULT_CALL_TIMEOUT_S)
+        finally:
+            _shutdown(proc)
+        self.assertEqual(resp.get("id"), 1, resp)
+        names = sorted(t["name"] for t in resp["result"]["tools"])
+        self.assertEqual(names, ["exec_sublime_python", "health_check"])
+
+    def test_health_check_responsive(self) -> None:
+        proc = _spawn_harness()
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            started = time.monotonic()
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {"name": "health_check", "arguments": {}},
+            })
+            resp = _recv(proc, timeout_s=DEFAULT_CALL_TIMEOUT_S)
+            elapsed = time.monotonic() - started
+        finally:
+            _shutdown(proc)
+
+        self.assertEqual(resp.get("id"), 42, resp)
+        self.assertFalse(resp["result"]["isError"], resp)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        for key in (
+            "main_thread_responsive",
+            "main_thread_probe_elapsed_s",
+            "plugin_host_pid",
+            "uptime_s",
+            "container_id",
+            "st_version",
+            "st_channel",
+        ):
+            self.assertIn(key, payload, payload)
+        self.assertTrue(payload["main_thread_responsive"], payload)
+        self.assertLess(payload["main_thread_probe_elapsed_s"], 0.5, payload)
+        self.assertGreater(payload["plugin_host_pid"], 0)
+        self.assertGreaterEqual(payload["uptime_s"], 0)
+        self.assertGreater(payload["st_version"], 4000)
+        # End-to-end roundtrip well under the 60s ceiling — proves the
+        # tool isn't accidentally routed through `_exec_on_worker`.
+        self.assertLess(elapsed, 5.0, "responsive health_check took %.2fs" % elapsed)
+
+    def test_health_check_during_wedge(self) -> None:
+        """While ST's main thread is sleeping, `health_check` returns quickly.
+
+        Unlike `test_wedge_logs_faulthandler`, this test does NOT need to
+        wait for the 60s exec ceiling — the wedge-installer snippet
+        returns immediately on the worker thread (it just schedules a
+        `set_timeout` callback and exits), so we can send `health_check`
+        right away and observe the unresponsive main thread for the
+        duration of the scheduled sleep.
+        """
+        proc = _spawn_harness()
+        captured: list = []
+        try:
+            _wait_ready(proc, captured, time.monotonic() + READY_TIMEOUT_S)
+            wedge_install = (
+                "import time\n"
+                "sublime.set_timeout(lambda: time.sleep(6), 0)\n"
+            )
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 100,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_sublime_python",
+                    "arguments": {"code": wedge_install},
+                },
+            })
+            resp_install = _recv(proc, timeout_s=DEFAULT_CALL_TIMEOUT_S)
+            self.assertEqual(resp_install.get("id"), 100, resp_install)
+            # ST schedules the timeout off the main loop; give it a beat
+            # so the sleep is actually in flight before we probe.
+            time.sleep(0.3)
+
+            started = time.monotonic()
+            _send(proc, {
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": {"name": "health_check", "arguments": {}},
+            })
+            resp = _recv(proc, timeout_s=DEFAULT_CALL_TIMEOUT_S)
+            elapsed = time.monotonic() - started
+        finally:
+            _shutdown(proc)
+
+        self.assertEqual(resp.get("id"), 101, resp)
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        self.assertFalse(
+            payload["main_thread_responsive"],
+            "expected main_thread_responsive=False during wedge: %s" % payload,
+        )
+        # Probe is internally capped at 2.0s; allow generous slack on
+        # round-trip. The contract that justifies the whole tool is "not
+        # 60s" — assert well under that.
+        self.assertLess(
+            elapsed, 4.0,
+            "health_check during wedge took %.2fs" % elapsed,
+        )
+        self.assertGreaterEqual(
+            payload["main_thread_probe_elapsed_s"], 1.5, payload,
+        )
+
+
 def run() -> int:
     if not _docker_available():
         print("SKIP: docker not available", file=sys.stderr)
         return 0
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestUnifiedLogging)
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite([
+        loader.loadTestsFromTestCase(TestUnifiedLogging),
+        loader.loadTestsFromTestCase(TestHealthCheck),
+    ])
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     return 0 if result.wasSuccessful() else 1
