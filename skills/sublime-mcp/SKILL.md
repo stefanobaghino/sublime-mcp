@@ -125,7 +125,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
-**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
+**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. If the call hangs or times out instead of raising, the host-side-write footgun is the likely cause — same root, different shape; see §4. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
 
 ### 3.2 health_check
 
@@ -142,6 +142,8 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 ## 4. Recipes
 
 Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`. Paths shown are container-side; the user typically mounts their working tree at `/work`.
+
+**Host-side file-write tools.** If you're driving this skill from an agent harness with its own host-side write tool (Claude Code's `Write`, Cursor's edit tool, anything similar), don't pre-write probe files to host paths and then pass those paths into `exec_sublime_python` helpers. The container only sees paths under `--mount` directories (typically `/work`) plus its own `/tmp`; anything else is invisible regardless of how the path looks on the host. The failure shape is a hang or indexer-budget timeout (the #67 / #73 surfaces), not a clean `FileNotFoundError`. Write probe files inside the snippet instead — see *Probe a synthetic case inline* and *Probe a synthetic syntax against a synthetic input* below.
 
 ### Scope at a position
 
