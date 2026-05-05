@@ -38,6 +38,12 @@ ENDPOINT = "/mcp"
 EXEC_TIMEOUT_SECONDS = 60.0
 OPEN_FILE_TIMEOUT_SECONDS = 5.0
 
+# Container-side mount root. The harness's recommended invocation
+# (`--mount $PWD:/work`) places the user's project tree here; paths
+# passed into `exec_sublime_python` resolve against it. Echoed in
+# response envelopes so callers have a contract anchor.
+WORKSPACE_PATH = "/work"
+
 LOG_FORMAT = (
     "%(asctime)s.%(msecs)03d  %(levelname)-7s  [%(component)s]  "
     "req=%(req_id)s  %(message)s"
@@ -1380,11 +1386,17 @@ def _exec_on_worker(code):
     """Run `code` on a dedicated daemon thread and collect output.
 
     Returns a dict with keys `output`, `result`, `error`, `st_version`,
-    `st_channel`. `error is None` means the snippet ran to completion.
-    `st_version` / `st_channel` echo the running ST build so callers can
-    detect when they're driving (e.g.) ST stable while their question
-    was authored against ST DEV — read per-call so an in-place ST
-    upgrade is reflected without restart.
+    `st_channel`, `container_id`, `workspace_path`. `error is None`
+    means the snippet ran to completion. `st_version` / `st_channel`
+    echo the running ST build so callers can detect when they're
+    driving (e.g.) ST stable while their question was authored against
+    ST DEV — read per-call so an in-place ST upgrade is reflected
+    without restart. `container_id` (Docker `HOSTNAME`) lets a host-side
+    recovery script identify which `sublime-mcp-harness` container
+    owns a given response without grep-and-reverse-map (#74).
+    `workspace_path` is the contract anchor for paths passed into
+    helpers — always `/work` when the user followed install instructions
+    (#76).
     """
     done = threading.Event()
     # ST guarantees `sublime.version()` is a stringified integer; cast
@@ -1395,6 +1407,8 @@ def _exec_on_worker(code):
         "error": None,
         "st_version": int(sublime.version()),
         "st_channel": sublime.channel(),
+        "container_id": os.environ.get("HOSTNAME") or None,
+        "workspace_path": WORKSPACE_PATH,
     }
 
     # Capture the parent's request id so the worker thread's log lines
@@ -1557,6 +1571,7 @@ def _run_health_check():
         "plugin_host_pid": os.getpid(),
         "uptime_s": uptime_s,
         "container_id": os.environ.get("HOSTNAME") or None,
+        "workspace_path": WORKSPACE_PATH,
         "st_version": int(sublime.version()),
         "st_channel": sublime.channel(),
     }
@@ -1736,9 +1751,39 @@ _thread = None
 _startup_monotonic = None
 
 
+def _looks_like_harness_source(entries):
+    """Predicate for the harness-self-mount detection (#76).
+
+    The user's recommended invocation is `--mount $PWD:/work`. When
+    they register the MCP server from inside the sublime-mcp source
+    repo and then drive a different project, `/work` ends up bound to
+    the harness source instead of their workspace — and the agent
+    sees `Dockerfile` / `sublime_mcp.py` / `harness.py` and assumes
+    that's the project. Both `sublime_mcp.py` and `Dockerfile`
+    co-occur at the top only in the harness source repo; either alone
+    is too loose.
+    """
+    return "sublime_mcp.py" in entries and "Dockerfile" in entries
+
+
+def _warn_if_harness_self_mounted():
+    try:
+        entries = set(os.listdir(WORKSPACE_PATH))
+    except OSError:
+        return
+    if _looks_like_harness_source(entries):
+        logger.warning(
+            "%s appears to be the harness source repo, not a project "
+            "workspace. Re-register the MCP server from your project "
+            "directory if this is unintended.",
+            WORKSPACE_PATH,
+        )
+
+
 def plugin_loaded():
     global _server, _thread, _startup_monotonic
     _configure_bridge_logging()
+    _warn_if_harness_self_mounted()
     if _startup_monotonic is None:
         _startup_monotonic = time.monotonic()
     if _server is not None:

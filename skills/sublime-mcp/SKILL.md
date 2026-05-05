@@ -112,12 +112,14 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 `mcp__sublime-text__exec_sublime_python({ code })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
 
 ```json
-{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "isError": false }
+{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "container_id": "<docker cid>", "workspace_path": "/work", "isError": false }
 ```
 
 - A trailing bare expression is auto-lifted into `_`, or assign to `_` explicitly at top level. Either way, `repr(_)` is returned as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
 - `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
+- `container_id` is the Docker short cid of the harness container handling the call. When recovery requires `docker kill` / `docker exec`, use this field rather than `docker ps --filter label=sublime-mcp-harness -q` (which lists *every* harness container on the host — multiple Claude Code sessions can run concurrently).
+- `workspace_path` is the in-container mount root paths resolve against — always `/work` when the user followed the install instructions. Treat it as the contract anchor: every path argument you pass to `scope_at` / `run_syntax_tests` / `open_view` is interpreted against this root.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
 - Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
 
@@ -130,7 +132,7 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 `mcp__sublime-text__health_check({})` is a worker-thread-only probe that detects when ST's main thread is wedged. It returns within ~2.5s regardless of main-thread state and never goes near the 60s `exec_sublime_python` ceiling. Response shape:
 
 ```json
-{ "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "st_version": 4200, "st_channel": "stable" }
+{ "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "workspace_path": "/work", "st_version": 4200, "st_channel": "stable" }
 ```
 
 **Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Ask the user to restart the container; do not retry. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
