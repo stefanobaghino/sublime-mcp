@@ -702,9 +702,15 @@ def main(argv: list[str] | None = None) -> int:
             stop_container(cid)
         except Exception as exc:
             logger.warning("cleanup of container %s failed: %r", cid[:12], exc)
+        # Tell the tail thread to wind down. EOF on stdin walks us
+        # here without ever setting `stop_event` (signal handlers do
+        # that), so without this the daemon-thread exits when main()
+        # returns and its finally — including the tail-byte dump —
+        # never runs.
+        stop_event.set()
         # Give the tail thread a beat to drain the final bridge writes
         # (including any faulthandler dump) before unlinking the file.
-        time.sleep(0.3)
+        tail_thread.join(timeout=1.0)
         try:
             os.unlink(bridge_log_path)
         except OSError:
