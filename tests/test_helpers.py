@@ -1684,20 +1684,6 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
         self.assertIn("temp_packages_link", outcome["error"])
 
 
-@unittest.skipIf(
-    sys.platform == "darwin",
-    "previous attempts at a producer-side retry helper wedged macOS "
-    "run-tests for unclear reasons (no per-test output streamed for 5+ min "
-    "before cancel); the races this regression covers were characterised "
-    "against the production Linux/Docker harness, which is what the test "
-    "guards. The OP-direction `view.settings()['syntax']` substitution and "
-    "the symmetric-direction `view.scope_name(point)` poll in `sublime_mcp.py` "
-    "are both designed to stay outside the wedge boundary (no `view.syntax()` "
-    "re-read; the scope_name poll mirrors `assign_syntax_and_wait` stage 2's "
-    "shipped shape), but skipping here keeps macOS run-tests fast and is "
-    "parallel to the existing skip pattern. Removing this skip is tracked as "
-    "a separate verification step on the same branch.",
-)
 class TestResolvePositionPostAssignRace(HelperTestBase):
     """`resolve_position` absorbs both directions of #70/#94's post-assign
     race against a fresh synthetic syntax. The OP direction (`view.syntax()`
