@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -89,7 +90,11 @@ def run() -> int:
 
     # `python -u` keeps stdout/stderr unbuffered so we see ready promptly.
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(HARNESS)],
+        [
+            sys.executable, "-u", str(HARNESS),
+            "--agent-name", "harness-smoke",
+            "--session-id", str(uuid.uuid4()),
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
