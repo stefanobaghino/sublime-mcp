@@ -544,7 +544,7 @@ class TestHarnessSelfMountWarning(unittest.TestCase):
     def test_warning_fires_when_repo_mounted_at_work(self) -> None:
         # Mounting the repo at /work is the canonical mistake: the user
         # registered the MCP server from inside the sublime-mcp source
-        # tree. Both `sublime_mcp.py` and `Dockerfile` are present at
+        # tree. Both `plugin.py` and `Dockerfile` are present at
         # the top, which is the predicate the helper checks.
         proc = _spawn_harness(extra_args=["--mount", "%s:/work" % REPO])
         captured: list = []

@@ -24,7 +24,7 @@ and is also cross-platform — this script works wherever ST and
 Python 3 are installed.
 
 Standalone (not under UnitTesting). Pre-conditions:
-  - Sublime Text is running with the sublime_mcp plugin loaded.
+  - Sublime Text is running with the sublime-mcp plugin loaded.
   - The plugin is listening on `MCP_URL` (default
     `http://127.0.0.1:47823/mcp`).
   - At least one ST window is open at script start.
@@ -106,7 +106,7 @@ def _wait_for_server():
     raise SystemExit(
         "headless_smoke: MCP server at %s did not respond within %ss "
         "(last error: %r). Pre-condition: ST must be running with the "
-        "sublime_mcp plugin loaded." % (MCP_URL, SERVER_POLL_TIMEOUT_S, last_exc)
+        "sublime-mcp plugin loaded." % (MCP_URL, SERVER_POLL_TIMEOUT_S, last_exc)
     )
 
 

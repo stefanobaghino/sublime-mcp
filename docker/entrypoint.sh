@@ -1,7 +1,7 @@
 #!/bin/sh
 # Boot Xvfb, launch Sublime Text against the workspace, and stay alive
 # until the container is stopped. The plugin_loaded() hook in
-# sublime_mcp.py binds 127.0.0.1:47823 once ST starts.
+# plugin.py binds 127.0.0.1:47823 once ST starts.
 #
 # ST self-daemonizes (re-execs as `--detached`) and the launching
 # `subl` wrapper exits as soon as the daemon is up. So we cannot

@@ -2177,12 +2177,12 @@ def _looks_like_harness_source(entries):
     they register the MCP server from inside the sublime-mcp source
     repo and then drive a different project, `/work` ends up bound to
     the harness source instead of their workspace — and the agent
-    sees `Dockerfile` / `sublime_mcp.py` / `harness.py` and assumes
-    that's the project. Both `sublime_mcp.py` and `Dockerfile`
+    sees `Dockerfile` / `plugin.py` / `harness.py` and assumes
+    that's the project. Both `plugin.py` and `Dockerfile`
     co-occur at the top only in the harness source repo; either alone
     is too loose.
     """
-    return "sublime_mcp.py" in entries and "Dockerfile" in entries
+    return "plugin.py" in entries and "Dockerfile" in entries
 
 
 def _warn_if_harness_self_mounted():
