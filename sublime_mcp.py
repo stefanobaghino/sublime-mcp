@@ -271,7 +271,15 @@ them in `run_on_main(...)`. The following names are preloaded:
   `ValueError` on degenerate input (zero or two of `syntax_path`
   / `syntax_yaml`; `syntax_path` outside the Packages tree),
   `RuntimeError` on indexing miss or content-doesn't-land within
-  1 s, `TimeoutError` on syntax-assign timeout.
+  1 s, `TimeoutError` on syntax-assign timeout. Also raises
+  `RuntimeError` on the case-3 silent fallback from #78: ST
+  registered the syntax structurally with a non-plain declared
+  base scope, but `view.scope_name(0)` is still `text.plain` past
+  `assign_syntax_and_wait` stage 2's 200 ms poll plus an extra
+  200 ms re-poll — i.e. the parse-table builder rejected an
+  action shape ST doesn't compile (e.g. multi-target `embed:`
+  list form). The raise prevents an all-`text.plain` result from
+  being misread as the probe outcome.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -1501,6 +1509,16 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
     # managed within-call via try/finally for the view and the temp
     # dir; `_sweep_stale_temp_dirs` runs at the head of `_new_temp_dir`
     # / `_sweep_stale_temp_dirs` callers so SIGKILL paths are covered.
+    #
+    # Raises `RuntimeError` on the case-3 silent fallback from #78:
+    # the syntax registers structurally with a non-plain declared base
+    # scope but `view.scope_name(0)` is still `text.plain` past
+    # `assign_syntax_and_wait` stage 2's 200 ms poll plus an extra
+    # 200 ms re-poll. ST accepted the YAML but its parse-table builder
+    # rejected something deeper (e.g. an action shape ST doesn't
+    # compile, like multi-target `embed:`); without the raise, the
+    # helper would silently return an all-`text.plain` result the
+    # caller would misread as their probe.
     if (syntax_path is None) == (syntax_yaml is None):
         raise ValueError(
             "probe_scopes: exactly one of syntax_path / syntax_yaml required"
@@ -1555,6 +1573,40 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
             )
 
         resolved = _resolved_syntax_with_op_race_mitigation(view, syntax_uri)
+        # Case-3 health check (#78). `assign_syntax_and_wait` stage 2
+        # already polled `view.scope_name(0)` for 200 ms waiting for it
+        # to change from pre-assign. If after that it's still
+        # `text.plain` and the registered syntax declares a non-plain
+        # base, ST accepted the YAML structurally but its parse-table
+        # builder rejected something deeper. Re-poll once for race
+        # tolerance (in case stage 2 fell through under load), then
+        # raise if still stuck. Detection at point 0 specifically — not
+        # the tail — so race tolerance at the warm point below stays
+        # decoupled from health-checking.
+        syntax_obj = (
+            sublime.syntax_from_path(resolved) if resolved else None
+        )
+        if syntax_obj is None:
+            syntax_obj = view.syntax()
+        declared_base = syntax_obj.scope if syntax_obj is not None else None
+        if (
+            declared_base is not None
+            and not declared_base.startswith("text.plain")
+            and view.scope_name(0).rstrip() == "text.plain"
+        ):
+            case3_deadline = _time.time() + 0.2
+            while _time.time() < case3_deadline:
+                if view.scope_name(0).rstrip() != "text.plain":
+                    break
+                _time.sleep(0.02)
+            if view.scope_name(0).rstrip() == "text.plain":
+                raise RuntimeError(
+                    "probe_scopes: parse-table build failed for %s "
+                    "(syntax registered with declared base %r, but "
+                    "tokenisation returned text.plain at point 0; "
+                    "see #78)"
+                    % (syntax_uri, declared_base)
+                )
         sweep_points = (
             list(points) if points is not None else list(range(view.size() + 1))
         )
@@ -1563,7 +1615,10 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
         # converge — wait there once rather than per-point. Same
         # wedge boundary as PR #95: scope_name only, no
         # `view.syntax()` re-read, 50 Hz / 200 ms shape mirrors
-        # assign_syntax_and_wait stage 2.
+        # assign_syntax_and_wait stage 2. Falls through on budget
+        # exhaustion — under-CI race that hasn't converged yet returns
+        # text.plain rather than raising; case-3 is detected at point 0
+        # above, so this gate stays purely about race tolerance.
         if sweep_points:
             warm_point = max(sweep_points)
             warm = view.scope_name(warm_point).rstrip()
