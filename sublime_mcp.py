@@ -247,6 +247,31 @@ them in `run_on_main(...)`. The following names are preloaded:
   fresh-resource probes hit indexing latency too often for raise to
   be the right default). The header inside `content` chooses the
   syntax under test; the syntax must already be reachable.
+- `probe_scopes(content, syntax_path=None, syntax_yaml=None,
+  points=None, rstrip_scopes=True) -> dict` — scratch-view scope
+  sweep for "what scopes does ST emit at these points?" probes.
+  Opens a scratch view, assigns a syntax (existing
+  `Packages/...` URI / filesystem path under `packages_path()`,
+  *or* a synthetic grammar passed inline as `syntax_yaml`),
+  appends `content`, sweeps `view.scope_name(p)` at every point
+  (or just `points`), captures the full token list via
+  `extract_tokens_with_scopes`, tears down. Returns
+  `{"scopes": {int: str}, "tokens": [{"region": [a, b], "text",
+  "scope"}, ...], "view_size": int, "syntax": str,
+  "resolved_syntax": str | None}`. `scopes` keys are int and JSON
+  serialisation will stringify them; use `repr(_)` / `result` if
+  int round-trip is required. The `syntax_yaml` path writes the
+  inline grammar under a managed
+  `Packages/User/__sublime_mcp_temp_<nonce>__/` dir (same shape as
+  `run_inline_syntax_test`) and removes it on exit — synthetic
+  grammars don't leak into `Packages/User/Probe.sublime-syntax`.
+  Tolerates the post-assign race via the same `view.scope_name`
+  warm-up shape as `scope_at_test` / `resolve_position` — single
+  warm-up at the highest sweep point, not per-point. Raises
+  `ValueError` on degenerate input (zero or two of `syntax_path`
+  / `syntax_yaml`; `syntax_path` outside the Packages tree),
+  `RuntimeError` on indexing miss or content-doesn't-land within
+  1 s, `TimeoutError` on syntax-assign timeout.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -502,6 +527,13 @@ print(v.size())  # 5
 v.set_scratch(True)
 v.close()
 ```
+
+For the common case of synthesising a buffer purely to sweep scopes,
+prefer `probe_scopes` — it bundles the lifecycle (open / assign /
+append / size-poll / sweep / close) and the optional synthetic-syntax
+cleanup, so the recipe above is only needed when the probe shape
+doesn't fit `probe_scopes` (e.g. incremental edits across multiple
+runs).
 
 ## Gotchas
 
@@ -1426,6 +1458,159 @@ def run_inline_syntax_test(content, name):
     finally:
         import shutil as _shutil
         _shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def probe_scopes(content, syntax_path=None, syntax_yaml=None,
+                 points=None, rstrip_scopes=True):
+    # Open a scratch view, assign a syntax (existing or synthesised
+    # from `syntax_yaml`), append `content`, sweep `view.scope_name(p)`
+    # at every point (or just `points`), capture token list via
+    # `extract_tokens_with_scopes`, tear down. Composes
+    # `_new_temp_dir` / `assign_syntax_and_wait` / `run_on_main` /
+    # `_resolved_syntax_with_op_race_mitigation` plus the post-#94
+    # symmetric-race warm-up.
+    #
+    # Exactly one of `syntax_path` or `syntax_yaml` must be supplied.
+    # The `syntax_yaml` path writes the inline grammar under a managed
+    # `Packages/User/__sublime_mcp_temp_<nonce>__/` dir (same shape as
+    # `run_inline_syntax_test`), assigns it as
+    # `Packages/User/<nonce>/Probe.sublime-syntax`, and removes the
+    # dir on exit — closing the `Packages/User/Probe.sublime-syntax`
+    # leak observed on the #63 follow-up (2026-05-04). The
+    # `temp_packages_link` symlink shape doesn't fit here because ST's
+    # indexer doesn't surface a duplicated path when the link target
+    # is itself inside the Packages tree. The `syntax_path` path
+    # takes either a `Packages/...` URI or a filesystem path under
+    # `sublime.packages_path()`, routed through `_to_resource_path`
+    # so the returned `syntax` field echoes the URI ST actually saw.
+    #
+    # Returns
+    #   {"scopes": {int: str, ...},
+    #    "tokens": [{"region": [a, b], "text": str, "scope": str}, ...],
+    #    "view_size": int,
+    #    "syntax": str,
+    #    "resolved_syntax": str | None}
+    #
+    # `scopes` is keyed by integer point. JSON serialisation will
+    # stringify the keys on the wire — a snippet that does
+    # `print(json.dumps(probe_scopes(...)))` and parses with
+    # `json.loads` will see `r["scopes"]["0"]`. Use `repr(_)` /
+    # `result` if int keys must round-trip.
+    #
+    # Two-layer cleanup mirrors `run_inline_syntax_test`: caller-
+    # managed within-call via try/finally for the view and the temp
+    # dir; `_sweep_stale_temp_dirs` runs at the head of `_new_temp_dir`
+    # / `_sweep_stale_temp_dirs` callers so SIGKILL paths are covered.
+    if (syntax_path is None) == (syntax_yaml is None):
+        raise ValueError(
+            "probe_scopes: exactly one of syntax_path / syntax_yaml required"
+        )
+    temp_dir = None
+    view = None
+    try:
+        if syntax_yaml is not None:
+            _sweep_stale_temp_dirs()
+            nonce_name, temp_dir = _new_temp_dir()
+            syntax_basename = "Probe.sublime-syntax"
+            with open(_os.path.join(temp_dir, syntax_basename), "w") as f:
+                f.write(syntax_yaml)
+            syntax_uri = "Packages/User/%s/%s" % (nonce_name, syntax_basename)
+            if not _wait_for_resource(syntax_uri):
+                raise RuntimeError(
+                    "probe_scopes: ST did not index %s within wait window"
+                    % syntax_uri
+                )
+        else:
+            converted = _to_resource_path(syntax_path)
+            if converted is None:
+                raise ValueError(
+                    "probe_scopes: syntax_path %r is not under "
+                    "sublime.packages_path() (directly or via a symlink "
+                    "in that directory). Use syntax_yaml to synthesise "
+                    "an inline grammar." % syntax_path
+                )
+            syntax_uri = converted
+
+        view = run_on_main(lambda: sublime.active_window().new_file())
+        run_on_main(lambda: view.set_scratch(True))
+        assign_syntax_and_wait(view, syntax_uri)
+        run_on_main(lambda: view.run_command(
+            "append", {"characters": content}
+        ))
+        # The append TextCommand schedules through set_timeout; the
+        # run_on_main dispatch returns when the schedule lands, not
+        # when the buffer is mutated. Poll view.size() to confirm
+        # the content actually landed — same shape as
+        # assign_syntax_and_wait stage 1 against settings(), and the
+        # documented mitigation for #33's silent-noop trap.
+        size_deadline = _time.time() + 1.0
+        while _time.time() < size_deadline:
+            if view.size() == len(content):
+                break
+            _time.sleep(0.02)
+        else:
+            raise RuntimeError(
+                "probe_scopes: content did not land within 1.0s "
+                "(view.size=%d, expected=%d)" % (view.size(), len(content))
+            )
+
+        resolved = _resolved_syntax_with_op_race_mitigation(view, syntax_uri)
+        sweep_points = (
+            list(points) if points is not None else list(range(view.size() + 1))
+        )
+        # Post-#94 symmetric-race warm-up. ST tokenises monotonically
+        # left-to-right, so the highest sweep point is the last to
+        # converge — wait there once rather than per-point. Same
+        # wedge boundary as PR #95: scope_name only, no
+        # `view.syntax()` re-read, 50 Hz / 200 ms shape mirrors
+        # assign_syntax_and_wait stage 2.
+        if sweep_points:
+            warm_point = max(sweep_points)
+            warm = view.scope_name(warm_point).rstrip()
+            if (
+                warm == "text.plain"
+                and resolved is not None
+                and resolved != "Packages/Text/Plain text.tmLanguage"
+            ):
+                warm_deadline = _time.time() + 0.2
+                while _time.time() < warm_deadline:
+                    _time.sleep(0.02)
+                    warm = view.scope_name(warm_point).rstrip()
+                    if warm != "text.plain":
+                        break
+
+        def _scope(p):
+            s = view.scope_name(p)
+            return s.rstrip() if rstrip_scopes else s
+
+        scopes = {p: _scope(p) for p in sweep_points}
+        raw_tokens = view.extract_tokens_with_scopes(
+            sublime.Region(0, view.size())
+        )
+        tokens = [
+            {
+                "region": [r.a, r.b],
+                "text": view.substr(r),
+                "scope": s.rstrip() if rstrip_scopes else s,
+            }
+            for r, s in raw_tokens
+        ]
+        return {
+            "scopes": scopes,
+            "tokens": tokens,
+            "view_size": view.size(),
+            "syntax": syntax_uri,
+            "resolved_syntax": resolved,
+        }
+    finally:
+        if view is not None:
+            try:
+                run_on_main(lambda: view.close())
+            except Exception:
+                _log.warning("probe_scopes: view.close failed", exc_info=True)
+        if temp_dir is not None:
+            import shutil as _shutil
+            _shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def run_syntax_tests(path):
