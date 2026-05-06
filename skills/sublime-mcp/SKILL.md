@@ -18,7 +18,7 @@ allowed-tools: Bash, Read, Grep, Glob, mcp__sublime-text__exec_sublime_python
 
 This skill drives the `sublime-mcp` server to get authoritative answers from Sublime Text itself — what scope it assigns at a point, which `.sublime-syntax` it resolved, whether an assertion file passes ST's built-in runner — via one tool, `exec_sublime_python`, which runs Python inside ST's plugin host.
 
-**Transport.** The server is a stdio MCP harness (`sublime-mcp`) that runs Sublime Text inside a Docker container. The agent's session spawns one harness process; the harness owns one container; the container runs ST + the plugin and is reclaimed when the harness exits. The agent never sees Docker — only the `mcp__sublime-text__exec_sublime_python` tool.
+**Transport.** The server is a stdio MCP shim (`sublime-mcp`) that runs Sublime Text inside a Docker container. The shim execs into `docker run -i --rm`; the in-container `bridge.py` proxies JSON-RPC stdio↔HTTP to the plugin's loopback HTTP server. One agent session, one container; `dockerd` reaps the container when the parent docker CLI dies. The agent never sees Docker — only the `mcp__sublime-text__exec_sublime_python` tool.
 
 ## 1. Preflight — check before driving the tool
 
@@ -28,37 +28,36 @@ If it's missing, diagnose with:
 
 ```bash
 claude mcp list | grep sublime-text
-docker ps --filter label=sublime-mcp-harness --format '{{.ID}} {{.Status}}'
+docker ps --format '{{.ID}} {{.Image}} {{.Status}}' | grep sublime-mcp
 ```
 
-Expected: `claude mcp list` shows `sublime-text ✓ Connected`; `docker ps` shows one running container per active agent session. If the registration is missing or shows ✗, point the user at `install.md` in this skill's directory. If the registration is healthy but the container is missing, the harness is failing to boot — read its stderr (Claude Code surfaces it in the MCP log; on the user's side, `claude mcp logs sublime-text` if available, otherwise the harness's stderr stream during connection).
+Expected: `claude mcp list` shows `sublime-text ✓ Connected`; `docker ps` shows one running `sublime-mcp:local` container per active agent session. If the registration is missing or shows ✗, point the user at `install.md` in this skill's directory. If the registration is healthy but the container is missing, the bridge is failing to come up — read the MCP server stderr (Claude Code surfaces it in the connection log; `claude mcp logs sublime-text` if available).
 
-Common boot-time failures the harness signals on stderr (look for `ERROR  [harness]`):
+Common boot-time failures the bridge signals on stderr (look for `ERROR  [bridge]`):
 
-- `docker unavailable` — install Docker and ensure the daemon is running.
-- `Sublime Text never opened a window` — Xvfb or licensing issue inside the container; check `docker logs <cid>`.
-- `docker build failed` — image build broke; re-run with `--rebuild` after fixing.
+- `docker: command not found` / `Cannot connect to the Docker daemon` — install Docker and ensure the daemon is running.
+- `Sublime Text never opened a window` — Xvfb or licensing issue inside the container; run `docker run --rm -it sublime-mcp:local` manually and inspect `/var/log/sublime.log` and `/var/log/xvfb.log`.
+- `docker build` failure during shim startup — `cd` into the checkout and run `docker build -t sublime-mcp:local .` directly to see the full output.
 
 Steady-state failures (timeout, hang, surprising scope) have their own diagnostic surface — see §1.1 below.
 
 Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
 
-## 1.1 Reading the unified log stream
+## 1.1 Reading the log stream
 
-The harness emits a single stderr stream that interleaves three components into one column shape:
+The bridge emits a single stderr stream that the parent docker CLI forwards to Claude Code's MCP server log. Lines are formatted as:
 
 ```
-2026-05-05T14:22:08.117  DEBUG    [harness]  req=42  forwarding method=tools/call bytes=1284
-2026-05-05T14:22:08.118  DEBUG    [bridge]   req=42  do_POST received bytes=1284 path=/mcp
-2026-05-05T14:22:08.119  INFO     [bridge]   req=42  worker entered
-2026-05-05T14:22:08.120  INFO     [bridge]   req=42  snippet exec begin code_bytes=312
-2026-05-05T14:22:08.123  INFO     [bridge]   req=42  snippet exec done error=no output_bytes=0
-2026-05-05T14:22:08.124  DEBUG    [harness]  req=42  received status=200 bytes=189
+2026-05-05T14:22:08.118  DEBUG    [bridge]  req=42  forwarding method=tools/call bytes=1284
+2026-05-05T14:22:08.119  INFO     [bridge]  req=42  worker entered
+2026-05-05T14:22:08.120  INFO     [bridge]  req=42  snippet exec begin code_bytes=312
+2026-05-05T14:22:08.123  INFO     [bridge]  req=42  snippet exec done error=no output_bytes=0
+2026-05-05T14:22:08.124  DEBUG    [bridge]  req=42  received status=200 bytes=189
 ```
 
-Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>`  `<message>`. Components: `[harness]` (host-side proxy), `[bridge]` (in-container plugin), `[st]` (anything else from the container's stdout/stderr — ST itself, plugin tracebacks, package_control noise).
+Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>`  `<message>`. The bridge logs as `[bridge]`. The plugin running inside ST's plugin host also writes to stderr; those lines reach `docker logs <cid>` (not the live stream — ST self-daemonizes and severs stdio from PID 1).
 
-**Read channels.** Live: harness stderr — `claude mcp logs sublime-text` if your build of Claude Code surfaces it, otherwise whatever stderr surface the host platform exposes. The live stream interleaves all three components in chronological order. Historical `[bridge]`: `docker exec <cid> cat /tmp/sublime-mcp-bridge.log` — the bridge writes its formatted log lines to that in-container file, which `harness.py` tails into the live stream. `docker logs <cid>` does **not** include `[bridge]` events because ST self-daemonizes (`docker/entrypoint.sh:6-11`) and the plugin host's `sys.stderr` is detached from PID 1; on Docker Desktop in particular `docker logs` returns 0 lines on a healthy container that has been logging happily to the in-container file. Historical `[st]`: `docker logs <cid>` is the right surface for ST's own stdout/stderr (plugin tracebacks, `package_control` chatter, anything ST writes to fd 1/2 of the pre-detach process), but expect it to be sparse or empty given the daemon detach.
+**Read channels.** Live (bridge proxy events): `claude mcp logs sublime-text` if your build of Claude Code surfaces it, otherwise whatever MCP-server stderr surface the host platform exposes. Historical / plugin-host events: `docker logs <cid>` — captures ST's own stdout/stderr (plugin tracebacks, `package_control` chatter, anything ST writes to its inherited streams). Expect it to be sparse on a healthy run because ST detaches early.
 
 **Levels.**
 
@@ -70,9 +69,9 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 **Troubleshooting workflow.**
 
 1. **Observe** the failure (timeout, error response, surprising scope).
-2. **Read backward** with `docker exec <cid> cat /tmp/sublime-mcp-bridge.log` to see the historical INFO trail of `[bridge]` events leading up to the failure. Grep for the `req=<id>` of the failing request to isolate its path through the bridge. Use `docker logs <cid>` only for the `[st]` channel (plugin tracebacks, etc.) — it does not contain `[bridge]` lines.
-3. **If the INFO trail isn't enough**, bump the bridge to DEBUG live — no restart needed: drive `exec_sublime_python` with `import logging; logging.getLogger("sublime_mcp.bridge").setLevel(logging.DEBUG)` and reproduce. Only works while the bridge is responsive (i.e. before a wedge); during an active wedge, bumping the level is moot — the diagnostic information is in the `faulthandler` dump that already fired at ERROR.
-4. **If the harness side is suspect**, restart with `--log-level DEBUG` (or set `SUBLIME_MCP_LOG_LEVEL=DEBUG` in the harness's environment); harness level is fixed per-session.
+2. **Read backward** in the live MCP log to see the INFO trail of `[bridge]` events leading up to the failure. Grep for the `req=<id>` of the failing request to isolate its path through the bridge. Use `docker logs <cid>` for plugin-host tracebacks and ST's own output.
+3. **If the INFO trail isn't enough**, bump the in-process plugin logger to DEBUG live — no restart needed: drive `exec_sublime_python` with `import logging; logging.getLogger("sublime_mcp.bridge").setLevel(logging.DEBUG)` and reproduce. Only works while the plugin is responsive (i.e. before a wedge); during an active wedge, bumping the level is moot — the diagnostic information is in the `faulthandler` dump that already fired at ERROR.
+4. **For the bridge process itself**, set `SUBLIME_MCP_LOG_LEVEL=DEBUG` in the agent's environment before connecting; the shim forwards it via `-e` to the container.
 
 **Common patterns.**
 
@@ -80,10 +79,10 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 |----------------------------|-------------|--------------|
 | `exec timed out after 60.0s` | no preceding `[bridge] worker entered` | bridge couldn't dispatch the worker (rare; check for plugin host crash). |
 | `exec timed out after 60.0s` | `[bridge] worker entered`, `[bridge] snippet exec begin`, no `[bridge] snippet exec done`, ends in `[bridge] ERROR worker did not complete in 60.0s; worker thread is_alive=True` plus a multi-line `faulthandler` traceback | snippet wedged on ST's main thread (canonical #73). The `faulthandler` dump pinpoints the thread waiting on `run_on_main` or similar. |
-| `container HTTP error: ...` | no preceding `[st]` traceback | container died (likely OOM / SIGKILL). Check `docker ps --filter label=sublime-mcp-harness`. |
-| `[st]` Python traceback with no `[bridge]` lines after | bridge thread crashed on an uncaught plugin-host exception | restart the harness; consider filing the traceback as a bridge bug. |
+| `plugin HTTP error: ...` | no preceding `docker logs` traceback | container died (likely OOM / SIGKILL). Check `docker ps`. |
+| Plugin-host Python traceback in `docker logs` with no further `[bridge]` lines | bridge thread crashed on an uncaught plugin-host exception | restart the agent session; consider filing the traceback as a bridge bug. |
 
-**Surfacing to the user.** Don't dump the whole trail — pull the ~30 lines around the failure boundary and grep for the failing `req=<id>`. The user's session already has the harness stderr; you're highlighting the relevant slice.
+**Surfacing to the user.** Don't dump the whole trail — pull the ~30 lines around the failure boundary and grep for the failing `req=<id>`. The user's session already has the bridge stderr; you're highlighting the relevant slice.
 
 ## 1.2 Capturing ST's own console output (don't bother)
 
@@ -118,7 +117,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 - A trailing bare expression is auto-lifted into `_`, or assign to `_` explicitly at top level. Either way, `repr(_)` is returned as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
 - `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
-- `container_id` is the Docker short cid of the harness container handling the call. When recovery requires `docker kill` / `docker exec`, use this field rather than `docker ps --filter label=sublime-mcp-harness -q` (which lists *every* harness container on the host — multiple Claude Code sessions can run concurrently).
+- `container_id` is the Docker short cid of the container handling the call. When recovery requires `docker kill` / `docker exec`, use this field rather than `docker ps -q` (which lists *every* container — multiple Claude Code sessions can run concurrently).
 - `workspace_path` is the in-container mount root paths resolve against — always `/work` when the user followed the install instructions. Treat it as the contract anchor: every path argument you pass to `scope_at` / `run_syntax_tests` / `open_view` is interpreted against this root.
 - Optional `timeout_seconds` (clamped to `[0.1, 60.0]`) lowers the 60 s ceiling for a single call. On expiry the response carries `error: "snippet exceeded the per-call timeout of <X>s"`, distinct from the transport-ceiling `error: "exec timed out after 60.0s"`. Use it for adversarial probes where a hang is the probe's answer ("does ST loop on this regex?") so the round-trip cost is the override budget rather than the full 60 s.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
@@ -140,7 +139,7 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 
 **Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Ask the user to restart the container; do not retry. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
 
-**`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. Recovery requires a true container restart (`docker kill $(docker ps --filter label=sublime-mcp-harness -q)`, then re-register). Don't read "Reconnected" as "wedge cleared."
+**`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. Recovery requires a true container restart (use the `container_id` from a previous response: `docker kill <cid>`), then re-connect. Don't read "Reconnected" as "wedge cleared."
 
 ## 4. Recipes
 

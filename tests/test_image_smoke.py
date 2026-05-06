@@ -1,21 +1,18 @@
-"""End-to-end smoke test for the stdio harness.
+"""End-to-end smoke test for the dockerized sublime-mcp.
 
-Spawns harness.py as a subprocess, drives it over stdin/stdout, and
-asserts the round-trip works against a real Docker container running
-Sublime Text + the plugin.
+Spawns `./sublime-mcp` as a subprocess, drives it over stdin/stdout,
+and asserts the round-trip works against a real Docker container
+running Sublime Text + the plugin.
 
-Skips if `docker --version` does not work — the test is meaningless
-without Docker. CI is expected to pre-`docker build` the image so the
-first invocation here only pays container boot, not image build.
+Skips if `docker --version` does not work.
 
-Run standalone (`python3 tests/test_harness_smoke.py`) or via pytest;
+Run standalone (`python3 tests/test_image_smoke.py`) or via pytest;
 the script self-skips on either entrypoint.
 """
 
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import signal
 import subprocess
@@ -25,7 +22,7 @@ import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-HARNESS = REPO / "harness.py"
+SHIM = REPO / "sublime-mcp"
 # Bridge logs this once both readiness probes (HTTP up, ST window open)
 # have completed and proxy_loop is about to start. See bridge.py:main.
 READY_LINE = b"accepting JSON-RPC on stdio"
@@ -44,21 +41,20 @@ def _docker_available() -> bool:
 
 
 def _wait_ready(proc: subprocess.Popen, deadline: float) -> None:
-    """Read stderr until we see the ready marker, mirroring lines through."""
     assert proc.stderr is not None
     while time.monotonic() < deadline:
         line = proc.stderr.readline()
         if not line:
             if proc.poll() is not None:
                 raise RuntimeError(
-                    "harness exited before readiness (status %d)" % proc.returncode
+                    "shim exited before readiness (status %d)" % proc.returncode
                 )
             time.sleep(0.05)
             continue
         sys.stderr.write(line.decode("utf-8", "replace"))
         if READY_LINE in line:
             return
-    raise RuntimeError("harness did not signal readiness within %.0fs" % READY_TIMEOUT_S)
+    raise RuntimeError("shim did not signal readiness within %.0fs" % READY_TIMEOUT_S)
 
 
 def _send(proc: subprocess.Popen, message: dict) -> None:
@@ -76,9 +72,9 @@ def _recv(proc: subprocess.Popen, timeout_s: float) -> dict:
         if line:
             return json.loads(line.decode("utf-8"))
         if proc.poll() is not None:
-            raise RuntimeError("harness exited while awaiting response")
+            raise RuntimeError("shim exited while awaiting response")
         time.sleep(0.05)
-    raise RuntimeError("no response from harness within %.0fs" % timeout_s)
+    raise RuntimeError("no response from shim within %.0fs" % timeout_s)
 
 
 def run() -> int:
@@ -86,17 +82,8 @@ def run() -> int:
         print("SKIP: docker not available", file=sys.stderr)
         return 0
 
-    # `python -u` keeps stdout/stderr unbuffered so we see ready promptly.
-    # `--image-tag sublime-mcp-harness:latest` matches the tag CI's
-    # pre-build step uses; a clean checkout would otherwise resolve a
-    # different (git-derived) tag and trigger a redundant build here.
     proc = subprocess.Popen(
-        [
-            sys.executable, "-u", str(HARNESS),
-            "--image-tag", "sublime-mcp-harness:latest",
-            "--agent-name", "harness-smoke",
-            "--session-id", str(uuid.uuid4()),
-        ],
+        [str(SHIM)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -113,7 +100,7 @@ def run() -> int:
             "params": {
                 "protocolVersion": "2025-11-25",
                 "capabilities": {},
-                "clientInfo": {"name": "harness-smoke", "version": "0"},
+                "clientInfo": {"name": "image-smoke", "version": "0"},
             },
         })
         resp = _recv(proc, timeout_s=15.0)
@@ -138,7 +125,7 @@ def run() -> int:
         output = (outcome.get("output") or "").strip()
         assert output.isdigit(), outcome
         assert int(output) >= 4000, outcome  # ST 4 build
-        print("PASS: harness round-trips, ST build %s" % output)
+        print("PASS: image round-trips, ST build %s" % output)
         return 0
     finally:
         if proc.poll() is None:
@@ -155,14 +142,13 @@ def run() -> int:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-        # Drain anything left on stderr so it shows up in CI logs.
         if proc.stderr is not None:
             tail = proc.stderr.read()
             if tail:
                 sys.stderr.write(tail.decode("utf-8", "replace"))
 
 
-def test_harness_round_trips() -> None:
+def test_image_round_trips() -> None:
     assert run() == 0
 
 
