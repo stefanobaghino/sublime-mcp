@@ -1178,11 +1178,25 @@ def wait_for_resource(pattern, timeout=3.0):
     # temp_packages_link) and need to wait for ST's resource indexer
     # to surface it before sampling.
     #
+    # `pattern` is matched as a glob against resource basenames —
+    # `sublime.find_resources` is basename-only, so full
+    # `Packages/<dir>/<file>` paths never match. The natural shape
+    # after `temp_packages_link` (compose `Packages/<name>/<file>`,
+    # pass it to `wait_for_resource`) is precisely the broken one.
+    # Raise `ValueError` on patterns containing `/` rather than
+    # silently returning `False` after burning the timeout (#100).
+    #
     # Prefer chaining this across snippets — write the file in one
     # exec, poll in a second — over polling inside the same snippet.
     # An in-snippet poll that exceeds EXEC_TIMEOUT_SECONDS is killed
     # at the transport, but the main-thread work it triggered can
     # leave ST wedged for the rest of the session (#64).
+    if "/" in pattern:
+        raise ValueError(
+            "wait_for_resource matches basenames only "
+            "(sublime.find_resources is basename-glob); "
+            "pass <basename> instead of <path>. Got: %r" % (pattern,)
+        )
     start = _time.time()
     deadline = start + timeout
     refresh_threshold = start + (timeout * 2.0 / 3.0)

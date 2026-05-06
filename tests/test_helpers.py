@@ -1079,6 +1079,37 @@ class TestWaitForResourcePublic(HelperTestBase):
         # Make sure it fired exactly once, not on every poll iteration.
         self.assertEqual(lines[1].count("refresh_folder_list"), 1)
 
+    def test_raises_on_path_shaped_pattern(self):
+        # `find_resources` matches basenames only, so any pattern
+        # containing `/` silently never matches — `wait_for_resource`
+        # used to burn the full timeout returning False (#100). Now
+        # raises ValueError up front. Cover both the
+        # `Packages/<dir>/<file>` shape (the natural shape after
+        # `temp_packages_link` builds a URI) and a bare `<dir>/<file>`
+        # to anchor the rule on `/` rather than the `Packages/` prefix.
+        for pattern in ("Packages/Python/Python.sublime-syntax",
+                        "Python/Python.sublime-syntax"):
+            code = (
+                "import time\n"
+                "t0 = time.time()\n"
+                "try:\n"
+                "    wait_for_resource(%r, timeout=3.0)\n"
+                "except ValueError as e:\n"
+                "    print('raised', e)\n"
+                "elapsed = time.time() - t0\n"
+                "print(elapsed < 0.5)\n"
+            ) % (pattern,)
+            resp = yield from _call_tool_yielding(code)
+            outcome = _outcome(resp)
+            self.assertIsNone(outcome["error"], outcome.get("error"))
+            lines = outcome["output"].strip().splitlines()
+            self.assertTrue(lines[0].startswith("raised "), lines)
+            self.assertIn("matches basenames only", lines[0])
+            self.assertIn(repr(pattern), lines[0])
+            # Fast-fail: the raise happens at function entry, before
+            # any timer setup or polling.
+            self.assertEqual(lines[1], "True")
+
 
 class TestRunInlineSyntaxTest(HelperTestBase):
     """`run_inline_syntax_test` writes a probe file under
