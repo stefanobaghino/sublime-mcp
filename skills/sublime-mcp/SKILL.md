@@ -263,6 +263,28 @@ For iterating one-rule variants of the same syntax, overwrite `Foo.sublime-synta
 
 When ST is headless, `resolve_position` raises — use the *Read the scope chain via the runner's failure diagnostic* recipe above to sweep scopes against synthetic syntaxes without a window. Pair it with the same `temp_packages_link` setup this recipe uses; the runner reads through the link the same way `resolve_position` does.
 
+#### Cross-syntax / multi-syntax probes
+
+The recipe above works for single-syntax probes because `view.assign_syntax(URI)` resolves the linked syntax through ST's resource indexer. **Cross-syntax references inside the linked syntax — `push: scope:source.X`, `set: scope:...`, `embed: scope:...`, `include: scope:...`, file-path forms of all four — silently fall back to Plain Text under `temp_packages_link` (#108).** ST resolves those through a parse-table builder that doesn't pick up linked syntaxes the way the resource indexer and direct URI assignment do; every position inside the embedded region tokenises as `text.plain` (the Plain Text syntax's `meta_scope`) regardless of the guest's contributions, while the host's scopes everywhere else look correct — the result *appears* coherent, so the existing `requested == resolved` invariant doesn't trip.
+
+Workaround: write the syntaxes under `<sublime.packages_path()>/User/<subdir>/` and poll `sublime.find_syntax_by_scope(<scope>)` until each guest scope surfaces. The `Packages/User/<subdir>/` ingest path *does* feed ST's cross-syntax resolver, so `push:` / `set:` / `embed:` / `include:` against a guest scope resolve correctly. The basename-only `wait_for_resource` gate is insufficient here — the registry surfaces independently of resource-indexer batching, so poll the registry directly. Note the [#24 third comment](https://github.com/stefanobaghino/sublime-mcp/issues/24#issuecomment-4355566219) caveat that `Packages/User/<subdir>/` itself can fail to register intermittently.
+
+```python
+# Cross-syntax recipe: write under Packages/User/<subdir>/, poll registry.
+import os, time
+subdir = os.path.join(sublime.packages_path(), "User", "probe_xsyn")
+os.makedirs(subdir, exist_ok=True)
+with open(os.path.join(subdir, "Host.sublime-syntax"), "w") as f:
+    f.write(host_yaml)            # contains `push: scope:source.guest`
+with open(os.path.join(subdir, "Guest.sublime-syntax"), "w") as f:
+    f.write(guest_yaml)           # `scope: source.guest`
+deadline = time.time() + 3.0
+while not sublime.find_syntax_by_scope("source.guest") and time.time() < deadline:
+    time.sleep(0.02)
+assert sublime.find_syntax_by_scope("source.guest"), "guest never registered"
+# now resolve_position / probe_scopes against the host see the guest's scopes.
+```
+
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
 `view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
@@ -286,6 +308,8 @@ finally:
 The returned dict also carries `overflow` (past-EOL request wrapped into a later row), `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section. `requested_syntax` echoes the `syntax_path` argument and `resolved_syntax` is `view.syntax().path` — assert they match before treating `scope` as ground truth, since `view.assign_syntax` accepts any string and silently falls through to Plain Text when the URI doesn't resolve.
 
 `temp_packages_link` synthesises a unique nonce-named package, so the bundled `Packages/Java` continues to load alongside it — `requested_syntax != resolved_syntax` still flags any silent fallback to a built-in. The per-syntax mode is sufficient for synthetic probes and single-grammar regression triage; cross-grammar investigations where the testdata grammar embeds another testdata grammar (e.g. C# embedding RegExp) need a whole-tree mirror that shadows the built-ins, tracked separately in §6.
+
+This recipe only works because the syntax is consumed via direct URI assignment. If the linked syntax contains any cross-syntax reference (`push:` / `set:` / `embed:` / `include:` against a `scope:source.X` or a file-path target), ST silently falls back to Plain Text inside the embedded region — see the *Cross-syntax / multi-syntax probes* recipe above and write the syntaxes under `Packages/User/<subdir>/` instead.
 
 When a caller writes additional `.sublime-syntax` files into the already-linked dir between snippets — incremental probing — wait for them to surface via `wait_for_resource("MyProbe*.sublime-syntax")` from a follow-up snippet, *not* an in-snippet `find_resources` poll. An in-snippet poll that overruns `EXEC_TIMEOUT_SECONDS` is killed at the transport, but the main-thread state it touched can leave ST wedged for the rest of the session (#64).
 
@@ -387,6 +411,7 @@ _Last synced with issue state: 2026-05-06._
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
 - **whole-tree mirror** (follow-up to #24) — `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.
+- **#108** — `temp_packages_link` synthesises a `Packages/__sublime_mcp_temp_<nonce>__/` symlink whose contents are reachable via `find_resources` and `view.assign_syntax(URI)`, but ST's parse-table builder for cross-syntax references (`push:` / `set:` / `embed:` / `include:` against `scope:source.X` and file-path forms) doesn't pick them up — every position in the embedded region tokenises as `text.plain` while `requested == resolved` still holds on the host syntax, so the existing detectors don't trip. Workaround: write under `<sublime.packages_path()>/User/<subdir>/` and poll `find_syntax_by_scope` (see §4 *Cross-syntax / multi-syntax probes*). The `find_syntax_by_scope` registry itself does eventually surface linked syntaxes given enough wait, so it's not a reliable signal on its own — the parse-table builder is a separate ingest with its own failure mode.
 - **#34** — `find_resources` can list stale `Packages/...` paths whose `load_resource` raises `FileNotFoundError`; documented in §4 ("Filter find_resources output through load_resource").
 
 ## 7. Reference — preloaded helpers
@@ -400,7 +425,7 @@ _Last synced with issue state: 2026-05-06._
 - `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
 - `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
-- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`.
+- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`. Cross-syntax references (`push:` / `set:` / `embed:` / `include:`) inside a linked syntax silently fall back to Plain Text under the link path (#108) — for cross-syntax probes write under `<sublime.packages_path()>/User/<subdir>/` instead, see §4 *Cross-syntax / multi-syntax probes*.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
 - `wait_for_resource(pattern, timeout=3.0) -> bool` — poll `find_resources(pattern)` until any match surfaces or the budget expires. Use across snippets to wait for a file written in a prior `exec_sublime_python` to surface in ST's resource index — chaining cross-snippet avoids the wedge risk of in-snippet polling that overruns `EXEC_TIMEOUT_SECONDS`. `pattern` is matched as a glob against resource basenames only (`sublime.find_resources` semantics) — full `Packages/<dir>/<file>` paths never match. Raises `ValueError` if `pattern` contains `/` rather than silently returning `False` after burning the timeout (#100).
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
