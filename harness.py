@@ -236,13 +236,18 @@ def stage_build_context(src: Path) -> Path:
 # Git-derived image tag
 
 
-def derive_image_tag(src: Path) -> str:
-    """Return `sublime-mcp-harness:<git-sha12>` for the harness checkout at `src`.
+def derive_image_tag(src: Path) -> tuple[str, bool]:
+    """Return `(tag, dirty)` for the harness checkout at `src`.
 
-    Refuses if `src` isn't inside a git work tree or the work tree is
-    dirty (any staged, unstaged, or untracked change). The tag must
-    unambiguously identify a committed state. Pass `--image-tag` to
-    bypass both checks.
+    Tag is `sublime-mcp-harness:<sha12>` when the work tree is clean and
+    `sublime-mcp-harness:<sha12>-dirty` when it has any staged, unstaged,
+    or untracked change. The dirty tag is intentionally non-unique across
+    edits within the same HEAD — callers must force a rebuild when
+    `dirty` is true so the cache doesn't re-serve a stale image.
+
+    Refuses (raises `RuntimeError`) if `src` isn't inside a git work
+    tree — there's no committed sha to anchor the tag to. Pass
+    `--image-tag` to bypass.
     """
     inside = subprocess.run(
         ["git", "-C", str(src), "rev-parse", "--is-inside-work-tree"],
@@ -261,19 +266,16 @@ def derive_image_tag(src: Path) -> str:
         capture_output=True,
         text=True,
     )
-    if status.stdout.strip():
-        raise RuntimeError(
-            "harness source at %s has uncommitted changes — "
-            "commit or stash before running, or pass --image-tag to "
-            "override.\nDirty paths:\n%s" % (src, status.stdout.rstrip())
-        )
     head = subprocess.run(
         ["git", "-C", str(src), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     )
-    return "%s:%s" % (IMAGE_REPO, head.stdout.strip()[:12])
+    sha12 = head.stdout.strip()[:12]
+    dirty = bool(status.stdout.strip())
+    suffix = "-dirty" if dirty else ""
+    return "%s:%s%s" % (IMAGE_REPO, sha12, suffix), dirty
 
 
 # ---------------------------------------------------------------------
@@ -721,16 +723,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.image_tag is None:
         try:
-            tag = derive_image_tag(ctx)
+            tag, dirty = derive_image_tag(ctx)
         except RuntimeError as exc:
             logger.error("%s", exc)
             return 2
         logger.info("derived image tag %s from git HEAD", tag)
+        if dirty:
+            logger.warning(
+                "harness source has uncommitted changes; building fresh "
+                "from the work tree. The %s tag is not reproducible — "
+                "see `git status` for the dirty paths.",
+                tag,
+            )
     else:
         tag = args.image_tag
+        dirty = False
 
     try:
-        ensure_image(tag, args.rebuild, ctx)
+        ensure_image(tag, args.rebuild or dirty, ctx)
     except subprocess.CalledProcessError as exc:
         logger.error("docker build failed (exit %d)", exc.returncode)
         return exc.returncode or 1
