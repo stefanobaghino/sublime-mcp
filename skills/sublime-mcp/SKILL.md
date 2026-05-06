@@ -121,7 +121,7 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 - `workspace_path` is the in-container mount root paths resolve against — always `/work` when the user followed the install instructions. Treat it as the contract anchor: every path argument you pass to `scope_at` / `run_syntax_tests` / `open_view` is interpreted against this root.
 - Optional `timeout_seconds` (clamped to `[0.1, 60.0]`) lowers the 60 s ceiling for a single call. On expiry the response carries `error: "snippet exceeded the per-call timeout of <X>s"`, distinct from the transport-ceiling `error: "exec timed out after 60.0s"`. Use it for adversarial probes where a hang is the probe's answer ("does ST loop on this regex?") so the round-trip cost is the override budget rather than the full 60 s.
 - `run_syntax_tests(...)["state"]` reports the assertion-run outcome (`passed` / `failed`). `failures` is ST's raw multi-line diagnostic per assertion; `failures_structured` is the same list parsed into `{file, row, col, error_label, expected_selector, actual}` dicts for programmatic consumers (best-effort; `failures` remains canonical on parser miss).
-- Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `probe_scopes`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `reload_syntax`) are in scope without import.
+- Preloaded helpers (`scope_at`, `scope_at_test`, `resolve_position`, `run_syntax_tests`, `probe_scopes`, `open_view`, `assign_syntax_and_wait`, `find_resources`, `wait_for_resource`, `wait_for_scope`, `reload_syntax`) are in scope without import.
 
 The helpers split into two families. **View-driving** helpers (`scope_at`, `scope_at_test`, `resolve_position`, `probe_scopes`, `open_view`, `assign_syntax_and_wait`) require a window — they raise `RuntimeError` in headless ST. **Runner-driving** helpers (`run_syntax_tests`, `run_inline_syntax_test`) and resource queries (`find_resources`, `wait_for_resource`, `reload_syntax`, `temp_packages_link` / `release_packages_link`) work fine headless. When `len(sublime.windows()) == 0`, runner-driving experiments still proceed; only view-driving snippets need the user to open a window first (`open -a "Sublime Text"` on macOS).
 
@@ -267,25 +267,22 @@ When ST is headless, `resolve_position` raises — use the *Read the scope chain
 
 The recipe above works for single-syntax probes because `view.assign_syntax(URI)` resolves the linked syntax through ST's resource indexer. **Cross-syntax references inside the linked syntax — `push: scope:source.X`, `set: scope:...`, `embed: scope:...`, `include: scope:...`, file-path forms of all four — silently fall back to Plain Text under `temp_packages_link` (#108).** ST resolves those through a parse-table builder that doesn't pick up linked syntaxes the way the resource indexer and direct URI assignment do; every position inside the embedded region tokenises as `text.plain` (the Plain Text syntax's `meta_scope`) regardless of the guest's contributions, while the host's scopes everywhere else look correct — the result *appears* coherent, so the existing `requested == resolved` invariant doesn't trip. **`extends:` is path-based but resolved at load time through ST's resource lookup; it is not affected by this gap and works under `temp_packages_link` (#113).**
 
-Workaround: write the syntaxes under `<sublime.packages_path()>/User/<subdir>/` and poll `sublime.find_syntax_by_scope(<scope>)` until each guest scope surfaces. The `Packages/User/<subdir>/` ingest path *does* feed ST's cross-syntax resolver, so `push:` / `set:` / `embed:` / `include:` against a guest scope resolve correctly. The basename-only `wait_for_resource` gate is insufficient here — the registry surfaces independently of resource-indexer batching, so poll the registry directly. Note the [#24 third comment](https://github.com/stefanobaghino/sublime-mcp/issues/24#issuecomment-4355566219) caveat that `Packages/User/<subdir>/` itself can fail to register intermittently.
+Workaround: write the syntaxes under `<sublime.packages_path()>/User/<subdir>/` and use `wait_for_scope` to gate on each guest scope surfacing in `sublime.find_syntax_by_scope`. The `Packages/User/<subdir>/` ingest path *does* feed ST's cross-syntax resolver, so `push:` / `set:` / `embed:` / `include:` against a guest scope resolve correctly. The basename-only `wait_for_resource` gate is insufficient here — the scope registry is a separate ingest from the resource indexer, so use the scope-registry helper. Note the [#24 third comment](https://github.com/stefanobaghino/sublime-mcp/issues/24#issuecomment-4355566219) caveat that `Packages/User/<subdir>/` itself can fail to register intermittently.
 
 ```python
-# Cross-syntax recipe: write under Packages/User/<subdir>/, poll registry.
-import os, time
+# Cross-syntax recipe: write under Packages/User/<subdir>/, gate on the registry.
+import os
 subdir = os.path.join(sublime.packages_path(), "User", "probe_xsyn")
 os.makedirs(subdir, exist_ok=True)
 with open(os.path.join(subdir, "Host.sublime-syntax"), "w") as f:
     f.write(host_yaml)            # contains `push: scope:source.guest`
 with open(os.path.join(subdir, "Guest.sublime-syntax"), "w") as f:
     f.write(guest_yaml)           # `scope: source.guest`
-deadline = time.time() + 3.0
-while not sublime.find_syntax_by_scope("source.guest") and time.time() < deadline:
-    time.sleep(0.02)
-assert sublime.find_syntax_by_scope("source.guest"), "guest never registered"
+assert wait_for_scope(["source.host", "source.guest"]), "guests never registered"
 # now resolve_position / probe_scopes against the host see the guest's scopes.
 ```
 
-`sublime.find_syntax_by_scope(scope)` returns `list[Syntax]` (typically empty or single-element), not a single `Syntax` (#111). Truthy-context use as the registration gate above works either way; if you need to read attributes off the result (e.g. `.path`), index `[0]` first.
+`wait_for_scope(scope, timeout=3.0)` (#117) accepts a single scope or an iterable — the iterable form succeeds only when every scope surfaces, matching the host+guest shape above. `sublime.find_syntax_by_scope(scope)` itself returns `list[Syntax]` (typically empty or single-element), not a single `Syntax` (#111); `wait_for_scope` bakes the truthy-context handling in.
 
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
@@ -432,6 +429,7 @@ _Last synced with issue state: 2026-05-06._
 - `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`. Cross-syntax references (`push:` / `set:` / `embed:` / `include:`) inside a linked syntax silently fall back to Plain Text under the link path (#108) — for cross-syntax probes write under `<sublime.packages_path()>/User/<subdir>/` instead, see §4 *Cross-syntax / multi-syntax probes*.
 - `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
 - `wait_for_resource(pattern, timeout=3.0) -> bool` — poll `find_resources(pattern)` until any match surfaces or the budget expires. Use across snippets to wait for a file written in a prior `exec_sublime_python` to surface in ST's resource index — chaining cross-snippet avoids the wedge risk of in-snippet polling that overruns `EXEC_TIMEOUT_SECONDS`. `pattern` is matched as a glob against resource basenames only (`sublime.find_resources` semantics) — full `Packages/<dir>/<file>` paths never match. Raises `ValueError` if `pattern` contains `/` rather than silently returning `False` after burning the timeout (#100).
+- `wait_for_scope(scope, timeout=3.0) -> bool` — poll `sublime.find_syntax_by_scope(scope)` until every scope surfaces or the budget expires. Scope-registry counterpart of `wait_for_resource` (#117) — separate ingest from the resource indexer, required gate for cross-syntax probes (`push: scope:` / `set: scope:` / `embed: scope:` / `include: scope:`) per #108. Accepts a single scope string or an iterable; iterable form succeeds only when every scope is registered. Raises `ValueError` on an empty iterable.
 - `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
 
 Full signatures, gotchas, and threading guarantees live in `TOOL_DESCRIPTION` (read via `tools/list`). This reference is a cheat-sheet.

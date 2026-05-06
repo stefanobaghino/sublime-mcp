@@ -1111,6 +1111,115 @@ class TestWaitForResourcePublic(HelperTestBase):
             self.assertEqual(lines[1], "True")
 
 
+class TestWaitForScopePublic(HelperTestBase):
+    """`wait_for_scope(scope, timeout=3.0)` is the scope-registry
+    counterpart of `wait_for_resource` (#117). Used to gate cross-
+    syntax probes after writing host+guest syntaxes under
+    `Packages/User/<subdir>/` — the parse-table builder for
+    `push: scope:` / `embed: scope:` / `include: scope:` consults a
+    registry independent of the resource indexer (#108), so the
+    basename-only `wait_for_resource` gate is insufficient.
+    """
+
+    def test_default_timeout_is_three_seconds(self):
+        # Externally-visible default; mirrors the wait_for_resource
+        # anchor so the two helpers stay in lockstep.
+        code = (
+            "import inspect\n"
+            "_ = inspect.signature(wait_for_scope).parameters['timeout'].default\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "3.0")
+
+    def test_returns_true_for_existing_scope(self):
+        # source.python is bundled with ST 4 and present from startup,
+        # so the helper returns True well within the default budget.
+        code = (
+            "found = wait_for_scope('source.python')\n"
+            "print(found)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "True")
+
+    def test_returns_false_when_scope_misses(self):
+        # Tight budget so the test runs in well under a second; the
+        # scope is constructed to never match anything in ST's registry.
+        code = (
+            "import time\n"
+            "t0 = time.time()\n"
+            "found = wait_for_scope('source.__sublime_mcp_nonexistent__', timeout=0.1)\n"
+            "elapsed = time.time() - t0\n"
+            "print(found)\n"
+            "print(elapsed < 0.5)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "False")
+        self.assertEqual(lines[1], "True")
+
+    def test_iterable_form_succeeds_when_all_present(self):
+        # Multi-syntax cross-syntax probe shape: every scope in the
+        # iterable must be present before tokenisation can proceed.
+        code = (
+            "found = wait_for_scope(['source.python', 'source.json'])\n"
+            "print(found)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "True")
+
+    def test_iterable_form_fails_when_any_missing(self):
+        # All-or-nothing — even with source.python present, the bogus
+        # scope blocks success and the helper exhausts the budget.
+        code = (
+            "import time\n"
+            "t0 = time.time()\n"
+            "found = wait_for_scope(\n"
+            "    ['source.python', 'source.__sublime_mcp_nonexistent__'],\n"
+            "    timeout=0.1,\n"
+            ")\n"
+            "elapsed = time.time() - t0\n"
+            "print(found)\n"
+            "print(elapsed < 0.5)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "False")
+        self.assertEqual(lines[1], "True")
+
+    def test_raises_on_empty_iterable(self):
+        # Caller passing an empty list typically means a list-comp
+        # produced nothing — fast-raise so the bug surfaces at the
+        # call site rather than after the timeout.
+        code = (
+            "import time\n"
+            "t0 = time.time()\n"
+            "try:\n"
+            "    wait_for_scope([])\n"
+            "except ValueError as e:\n"
+            "    print('raised', e)\n"
+            "elapsed = time.time() - t0\n"
+            "print(elapsed < 0.5)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertTrue(lines[0].startswith("raised "), lines)
+        self.assertIn("at least one scope", lines[0])
+        self.assertEqual(lines[1], "True")
+
+
 class TestRunInlineSyntaxTest(HelperTestBase):
     """`run_inline_syntax_test` writes a probe file under
     `Packages/User/__sublime_mcp_temp_<nonce>__/`, runs ST's syntax-

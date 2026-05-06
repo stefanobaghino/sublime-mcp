@@ -1220,6 +1220,37 @@ def wait_for_resource(pattern, timeout=3.0):
     return False
 
 
+def wait_for_scope(scope, timeout=3.0):
+    # Public counterpart to wait_for_resource for the scope-name
+    # registry ST consults when resolving cross-syntax references
+    # (`push: scope:` / `set: scope:` / `embed: scope:` /
+    # `include: scope:`). Returns True when every requested scope
+    # surfaces in sublime.find_syntax_by_scope within the budget,
+    # False otherwise. Use after writing one or more .sublime-syntax
+    # files under <sublime.packages_path()>/User/<subdir>/ to gate
+    # cross-syntax probes — the scope registry is a separate ingest
+    # from the resource indexer that wait_for_resource polls (#108),
+    # so the basename gate is insufficient for cross-syntax work.
+    #
+    # `scope` accepts a single scope string or an iterable of scope
+    # strings. The iterable form succeeds only when every scope in
+    # the iterable surfaces — the recipe shape where one cross-syntax
+    # probe registers multiple host+guest syntaxes and all must be
+    # discoverable before tokenisation can succeed.
+    if isinstance(scope, str):
+        scopes = (scope,)
+    else:
+        scopes = tuple(scope)
+    if not scopes:
+        raise ValueError("wait_for_scope: requires at least one scope")
+    deadline = _time.time() + timeout
+    while _time.time() < deadline:
+        if all(sublime.find_syntax_by_scope(s) for s in scopes):
+            return True
+        _time.sleep(0.02)
+    return False
+
+
 _TEMP_DIR_PREFIX = "__sublime_mcp_temp_"
 _TEMP_DIR_SUFFIX = "__"
 _TEMP_DIR_MAX_AGE_SECONDS = 60.0
