@@ -1,0 +1,28 @@
+#!/bin/sh
+# Build the dockerized sublime-mcp image (cache-aware) and exec into
+# `docker run -i --rm` so the in-container bridge owns stdio. dockerd
+# reaps the container when the parent docker CLI dies.
+#
+# Register with Claude Code as a stdio MCP server. Use an absolute
+# path to this script — `dirname "$0"` is where docker build looks
+# for the Dockerfile, so symlinks won't resolve to the checkout.
+set -eu
+
+DIR="$(dirname "$0")"
+TAG=sublime-mcp:local
+RUN_ARGS=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mount)
+            [ $# -ge 2 ] || { echo "--mount requires HOST:CONTAINER" >&2; exit 2; }
+            RUN_ARGS="$RUN_ARGS -v $2"
+            shift 2
+            ;;
+        *)
+            echo "unknown flag: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+(cd "$DIR" && docker build -q -t "$TAG" .) >/dev/null
+exec docker run -i --rm $RUN_ARGS "$TAG"

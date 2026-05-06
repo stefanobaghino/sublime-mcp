@@ -5,52 +5,37 @@ This file is loaded only when `SKILL.md`'s preflight check (§1) fails. The top-
 ## What has to be true
 
 - **Docker is installed and the daemon is running.** `docker info` exits 0.
-- **The harness is on `PATH`.** `sublime-mcp --help` works.
+- **A POSIX shell is available.** The shim is `/bin/sh`.
 - **Claude Code has the server registered under the name `sublime-text`.**
   ```bash
   claude mcp list | grep sublime-text
   ```
   Expected: `sublime-text ✓ Connected`.
 
-When a Claude Code session is using the skill, `docker ps --filter label=sublime-mcp-harness` shows one running container. The harness owns the container; closing the session reclaims it.
+When a Claude Code session is using the skill, `docker ps` shows one running container per session. Closing the session triggers `dockerd` to reap the container.
 
-## Install the harness
+## Install the shim
 
-The harness is shipped as a single Python module + a Dockerfile, distributed via the source repo. v1 is editable-install only; the runtime needs the bundled assets to live next to the module.
+The shim lives in the source repo. There's nothing to install on `PATH`; register Claude Code with the absolute path to the script.
 
 ```bash
 git clone https://github.com/stefanobaghino/sublime-mcp.git
 cd sublime-mcp
-uv tool install --editable .
+chmod +x sublime-mcp
 ```
-
-`uv tool install --editable .` keeps `sublime-mcp` pointing at this checkout — pulling new commits picks them up; switching branches switches the harness code. `pipx install -e .` and plain `pip install -e .` work too if you already have one of those set up.
 
 ## Register with Claude Code
 
-The harness requires `--agent-name` and `--session-id` so each container can be named `st-<agent>-<session>` and matched back to the session that owns it. Both must come from the live agent context, so register the harness via a tiny launcher script (Claude Code's MCP launch is a static argv; it can't template per-session values directly):
-
-```bash
-# ~/.local/bin/sublime-mcp-launcher
-#!/usr/bin/env bash
-exec sublime-mcp \
-    --agent-name "${CLAUDE_AGENT_NAME:-claude-code}" \
-    --session-id "${CLAUDE_SESSION_ID:?CLAUDE_SESSION_ID must be set}" \
-    --mount "$PWD:/work" "$@"
-```
-
 ```bash
 claude mcp add --scope user --transport stdio sublime-text -- \
-    sublime-mcp-launcher
+    "$PWD/sublime-mcp" --mount "$PWD:/work"
 ```
-
-The launcher is the place to thread agent/session info from whatever the surrounding harness exposes (env vars, hook input, etc.). The harness itself hard-fails if either flag is missing.
 
 The name `sublime-text` is load-bearing: the skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
 
 `--mount $PWD:/work` makes the current working tree visible to ST inside the container. Repeat the flag for additional directories. **Without a `--mount`, every path you'd pass in `exec_sublime_python` calls is invisible to ST** — the skill recipes assume this mount.
 
-The first agent connection triggers `docker build`; expect a few minutes the first time. Subsequent connections boot the container in a few seconds.
+The shim runs `docker build -q` on every connect. The first connect builds from scratch — expect a few minutes. Subsequent reconnects pick up local edits to `plugin.py` / `bridge.py` automatically because Docker's layer cache invalidates on the late `COPY` lines.
 
 ## Smoke check
 
@@ -64,37 +49,36 @@ Returns ST's build number in `output` on a healthy setup. If the call errors wit
 
 ## Troubleshooting
 
-### Harness fails to start
+### Connection fails or hangs
 
-The harness writes diagnostics on stderr prefixed with `[sublime-mcp-harness]`. Common cases:
+The shim writes diagnostics to stderr; Claude Code surfaces them in the MCP connection log. Common cases:
 
-- `ERROR: docker not found on PATH` — install Docker (Docker Desktop on macOS/Windows, `docker-ce` package on Linux), start the daemon, retry.
-- `ERROR: docker build failed` — re-run `sublime-mcp --rebuild --mount …` to see the build output. Most often: transient apt-mirror failure; retry. If persistent, the apt repo for Sublime Text may have shifted; file an issue.
-- `ERROR: Sublime Text never opened a window (last state: …)` — the container booted but ST didn't reach a windowed state inside the readiness budget. Check `docker logs <container_id>` for Xvfb errors or licensing dialogs blocking startup.
+- `docker: command not found` — install Docker (Docker Desktop on macOS/Windows, `docker-ce` package on Linux), start the daemon, retry.
+- `docker build` failure — `cd` into the checkout and run `docker build -t sublime-mcp:local .` directly to see the full output. Most often: transient apt-mirror failure; retry. If persistent, the apt repo for Sublime Text may have shifted; file an issue.
+- `Sublime Text never opened a window` — the container booted but ST didn't reach a windowed state inside the readiness budget. Run the container manually (`docker run --rm -it sublime-mcp:local`) and check `/var/log/sublime.log` and `/var/log/xvfb.log` inside the container for licensing dialogs or X server errors.
 
 ### `docker ps` shows the container but tool calls hang
 
-The plugin host inside the container is wedged. Restart the agent session (closing it triggers `docker stop`); a fresh one will spawn a new container.
+The plugin host inside the container is wedged. Restart the agent session (closing it tells `dockerd` to reap the container); a fresh one will spawn a new container.
 
-### Multi-agent: ports / containers
+### Multi-agent
 
-Each agent session spawns its own harness, which spawns its own container. Host ports are kernel-assigned (`-p 127.0.0.1:0:47823`), so concurrent agents don't collide. `docker ps --filter label=sublime-mcp-harness` lists them; container names are `st-<agent>-<session-uuid>`, so the agent and session that own each container are visible in `docker ps` directly. The `sublime-mcp-harness=<pid>` label is still set for backwards-compatible filtering.
-
-Each ST instance uses ~100–300 MB RAM. If you routinely run many concurrent agents, watch overall memory pressure.
+Each agent session runs its own shim, which spawns its own container via `docker run -i --rm`. Container names are auto-generated; concurrent sessions don't collide. Each ST instance uses ~100–300 MB RAM — watch memory pressure if you routinely run many concurrent agents.
 
 ### Sublime Text license
 
-ST runs in evaluation mode by default inside the container. The plugin is unaffected; under Xvfb the nag dialog is invisible. To suppress evaluation state, pass a license:
+ST runs in evaluation mode by default inside the container. The plugin is unaffected; under Xvfb the nag dialog is invisible. To suppress evaluation state, mount a license through `--mount`:
 
 ```bash
-sublime-mcp --mount "$PWD:/work" --license-file ~/path/to/License.sublime_license
+"$PWD/sublime-mcp" --mount "$PWD:/work" \
+    --mount "$HOME/path/to/License.sublime_license:/root/.config/sublime-text/Local/License.sublime_license"
 ```
 
-The file is mounted read-only into the container's `~/.config/sublime-text/Local/`.
+The file is mounted into the container's `~/.config/sublime-text/Local/`.
 
 ## Verifying symlinked-package URI resolution
 
-`_to_resource_path` reverse-maps a path under a symlinked entry of `sublime.packages_path()` to a `Packages/<symlink_name>/...` URI that ST's resource indexer agrees on. Inside the container, `sublime.packages_path()` is `/root/.config/sublime-text/Packages`. To verify end-to-end via the harness:
+`_to_resource_path` reverse-maps a path under a symlinked entry of `sublime.packages_path()` to a `Packages/<symlink_name>/...` URI that ST's resource indexer agrees on. Inside the container, `sublime.packages_path()` is `/root/.config/sublime-text/Packages`. To verify end-to-end:
 
 ```python
 # Inside an exec_sublime_python call:
@@ -118,7 +102,7 @@ Success: `summary` is a numeric "N assertions passed" or "FAILED: M of N asserti
 ```bash
 claude mcp remove sublime-text
 claude mcp add --scope user --transport stdio sublime-text -- \
-    sublime-mcp-launcher
+    "$PWD/sublime-mcp" --mount "$PWD:/work"
 ```
 
 The name `sublime-text` is load-bearing: this skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
@@ -128,6 +112,6 @@ The name `sublime-text` is load-bearing: this skill's `allowed-tools` hard-codes
 Open an issue at <https://github.com/stefanobaghino/sublime-mcp/issues> with:
 
 - `claude mcp list` output
-- `docker ps --filter label=sublime-mcp-harness` output
+- `docker ps` output for the failing container
 - `docker logs <cid>` for the failing container (if any)
-- The harness's stderr (the `[sublime-mcp-harness]` lines)
+- The shim's stderr (bridge `[bridge]` lines)
