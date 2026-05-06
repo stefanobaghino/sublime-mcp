@@ -141,6 +141,8 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 
 **`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. Recovery requires a true container restart (use the `container_id` from a previous response: `docker kill <cid>`), then re-connect. Don't read "Reconnected" as "wedge cleared."
 
+**`/mcp` reconnect can also land on stale transport.** A `Reconnected to sublime-text.` message does not guarantee the transport has re-bound to the new container. If the next call returns `ConnectionRefusedError(61)`, the transport is still pointed at the previous container's stdio — dismiss `/mcp` and re-open (not just re-trigger) to force a re-bind. Independent of the wedge surface above: the stale-transport shape fires whenever the previous container went away (wedge recovery via `docker kill`, container OOM, container restart) and Claude Code's reconnect attempt landed before the new container was discoverable (#104). Guard pattern: after `docker kill` + reconnect, fire a single `health_check`; on `ConnectionRefusedError`, the user needs to re-open `/mcp` rather than the agent retrying.
+
 ## 4. Recipes
 
 Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`. Paths shown are container-side; the user typically mounts their working tree at `/work`.
