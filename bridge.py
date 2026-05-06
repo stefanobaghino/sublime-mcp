@@ -242,6 +242,7 @@ def main() -> int:
     except Exception:
         logger.exception("readiness probe failed")
         return 1
+    logger.info("ready, accepting JSON-RPC on stdio")
     proxy_loop()
     logger.info("stdin closed, exiting")
     return 0
