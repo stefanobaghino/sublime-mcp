@@ -257,6 +257,8 @@ _ = chains
 
 `resolve_position` over `scope_at` here: it surfaces `requested_syntax` / `resolved_syntax`, so a typo in the synthetic syntax that makes ST silently fall back to Plain Text trips the assertion instead of returning misleading scopes. The input file does not need to live under the symlinked dir — `resolve_position` opens any filesystem path. Co-locating it next to the syntax (as above) is a cleanup convention, not a requirement; the link only exists so ST can resolve the synthetic syntax.
 
+**Trap when assembling the YAML inline (#116).** `.sublime-syntax` files start with the directive `%YAML 1.2`. Do not build the file body via Python `%`-formatting — `"""%YAML 1.2\n…""" % var` raises `ValueError: unsupported format character 'Y' (0x59) at index 1` because Python parses `%Y` as an attempted format spec. Use f-strings, `str.format`, or plain string concatenation; only `%`-formatting trips the trap.
+
 For iterating one-rule variants of the same syntax, overwrite `Foo.sublime-syntax` under the link between sweeps and call `reload_syntax(syntax_uri)` to force ST to reparse — cheaper than tearing down and re-linking.
 
 When ST is headless, `resolve_position` raises — use the *Read the scope chain via the runner's failure diagnostic* recipe above to sweep scopes against synthetic syntaxes without a window. Pair it with the same `temp_packages_link` setup this recipe uses; the runner reads through the link the same way `resolve_position` does.
