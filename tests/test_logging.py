@@ -391,6 +391,7 @@ class TestHealthCheck(unittest.TestCase):
             "workspace_path",
             "st_version",
             "st_channel",
+            "plugin_version",
         ):
             self.assertIn(key, payload, payload)
         self.assertTrue(payload["main_thread_responsive"], payload)
@@ -511,6 +512,7 @@ class TestExecSublimePythonEnvelope(unittest.TestCase):
             "error",
             "st_version",
             "st_channel",
+            "plugin_version",
             "container_id",
             "workspace_path",
         ):
