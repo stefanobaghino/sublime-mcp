@@ -30,7 +30,7 @@ Issues = "https://github.com/stefanobaghino/sublime-mcp/issues"
 [tool.setuptools]
 # v1 ships as an editable install from a source checkout (`uv tool
 # install --editable .`). The harness reads Dockerfile,
-# docker/entrypoint.sh, and sublime_mcp.py from
+# docker/entrypoint.sh, and plugin.py from
 # `Path(__file__).parent`, so the source layout is what gets used at
 # runtime. A proper package layout for non-editable wheels (and `uvx`
 # from a git URL) can come when PyPI distribution becomes a goal.

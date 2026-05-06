@@ -960,7 +960,7 @@ class TestWaitForResource(HelperTestBase):
 
     def test_default_timeout_is_three_seconds(self):
         # The default reaches every transitive caller — _run_syntax_tests_via_api
-        # at sublime_mcp.py:518 inherits it without naming it, so the
+        # at plugin.py:518 inherits it without naming it, so the
         # signature itself is the right anchor.
         code = (
             "import inspect\n"

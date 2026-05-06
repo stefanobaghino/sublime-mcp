@@ -1,4 +1,4 @@
-# Headless Sublime Text image with sublime_mcp.py preloaded.
+# Headless Sublime Text image with plugin.py preloaded.
 #
 # Boots Xvfb on :1, launches `subl --stay /work`, and lets
 # plugin_loaded() bind sublime-mcp's HTTP server on 127.0.0.1:47823
@@ -54,7 +54,7 @@ RUN install -d /etc/apt/keyrings \
 # ST's per-user state goes under $HOME. We run as root inside the
 # container; that's fine for an ephemeral, single-tenant sandbox.
 RUN mkdir -p /root/.config/sublime-text/Packages/User
-COPY sublime_mcp.py /root/.config/sublime-text/Packages/User/sublime_mcp.py
+COPY plugin.py /root/.config/sublime-text/Packages/User/plugin.py
 # Pin User-package plugins to ST's Python 3.8 host. Without this, ST's
 # Linux build routes the User package to the 3.3 host, where
 # `from http.server import ThreadingHTTPServer` (added in 3.7) fails

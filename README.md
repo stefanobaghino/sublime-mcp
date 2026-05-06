@@ -47,7 +47,7 @@ uv tool install --editable .
 
 `uv tool install --editable .` keeps `sublime-mcp` pointing at this
 checkout (the harness reads the bundled `Dockerfile`,
-`docker/entrypoint.sh`, and `sublime_mcp.py` from
+`docker/entrypoint.sh`, and `plugin.py` from
 `Path(__file__).parent`, which an editable install resolves back to the
 source directory). `pipx install -e .` and plain `pip install -e .`
 work too if you already have one of those set up.
@@ -184,8 +184,8 @@ Useful for plugin-level work where booting Docker per change is
 overkill. The host-ST install path:
 
 ```sh
-ln -s "$PWD/sublime_mcp.py" \
-      "$HOME/Library/Application Support/Sublime Text/Packages/User/sublime_mcp.py"
+ln -s "$PWD/plugin.py" \
+      "$HOME/Library/Application Support/Sublime Text/Packages/User/plugin.py"
 ```
 
 Open ST and look for `[sublime-mcp] listening on 127.0.0.1:47823` in
