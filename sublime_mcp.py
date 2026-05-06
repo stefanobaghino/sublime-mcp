@@ -364,8 +364,7 @@ requests). The response shape is:
   "result": str|null,
   "error": str|null,
   "st_version": int,
-  "st_channel": str,
-  "plugin_version": str
+  "st_channel": str
 }
 ```
 
@@ -375,11 +374,7 @@ in this same `error` field — there is no separate helper-level
 error channel. `st_version` (e.g. `4200`) and `st_channel` (e.g.
 `"stable"`, `"dev"`) echo the running Sublime Text build on every
 response, so callers can detect channel mismatches before treating
-scope output as ground truth. `plugin_version` (e.g. `"0.1.0"`) is
-this plugin's `SERVER_VERSION`; pair it with the in-snippet
-`__sublime_mcp_version__` global to assert minimum versions before
-driving recipes that depend on newer helpers — e.g.
-`assert __sublime_mcp_version__ >= "<min>"` (#99).
+scope output as ground truth.
 
 ## Recipes
 
@@ -1763,14 +1758,12 @@ def _exec_on_worker(code, timeout_seconds=None):
     """Run `code` on a dedicated daemon thread and collect output.
 
     Returns a dict with keys `output`, `result`, `error`, `st_version`,
-    `st_channel`, `plugin_version`, `container_id`, `workspace_path`.
+    `st_channel`, `container_id`, `workspace_path`.
     `error is None` means the snippet ran to completion. `st_version` /
     `st_channel` echo the running ST build so callers can detect when
     they're driving (e.g.) ST stable while their question was authored
     against ST DEV — read per-call so an in-place ST upgrade is
-    reflected without restart. `plugin_version` echoes this plugin's
-    `SERVER_VERSION` so callers can detect drift between the bundled
-    SKILL.md and the channel-snapshot `sublime_mcp.py` (#99).
+    reflected without restart.
     `container_id` (Docker `HOSTNAME`) lets a host-side
     recovery script identify which `sublime-mcp-harness` container
     owns a given response without grep-and-reverse-map (#74).
@@ -1805,7 +1798,6 @@ def _exec_on_worker(code, timeout_seconds=None):
         "error": None,
         "st_version": int(sublime.version()),
         "st_channel": sublime.channel(),
-        "plugin_version": SERVER_VERSION,
         "container_id": os.environ.get("HOSTNAME") or None,
         "workspace_path": WORKSPACE_PATH,
     }
@@ -1830,7 +1822,6 @@ def _exec_on_worker(code, timeout_seconds=None):
         namespace = {
             "__name__": "sublime_mcp_exec",
             "__builtins__": __builtins__,
-            "__sublime_mcp_version__": SERVER_VERSION,
             "sublime": sublime,
             "sublime_plugin": sublime_plugin,
             "print": _print,
@@ -1992,7 +1983,6 @@ def _run_health_check():
         "workspace_path": WORKSPACE_PATH,
         "st_version": int(sublime.version()),
         "st_channel": sublime.channel(),
-        "plugin_version": SERVER_VERSION,
     }
     logger.info(
         "health_check responsive=%s elapsed=%.2fs uptime=%ds pid=%d",

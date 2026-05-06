@@ -217,21 +217,6 @@ class TestResponseShape(HelperTestBase):
         self.assertIsInstance(outcome["st_channel"], str)
         self.assertTrue(outcome["st_channel"])
 
-    def test_envelope_carries_plugin_version(self):
-        # `plugin_version` echoes the in-container plugin's
-        # SERVER_VERSION so operators and callers can detect drift
-        # between the bundled SKILL.md and the in-container
-        # `sublime_mcp.py` (#99). The plugin module isn't importable
-        # at the test level — ST namespaces plugin files under the
-        # package name, which is `sublime-mcp` here, not a valid
-        # Python identifier. Anchor on shape (non-empty string); the
-        # cross-reference against the namespace global lives in
-        # TestPluginVersionGlobal.
-        resp = yield from _call_tool_yielding("print('hi')")
-        outcome = _outcome(resp)
-        self.assertIsInstance(outcome["plugin_version"], str)
-        self.assertTrue(outcome["plugin_version"])
-
 
 class TestScopeAtExtensionless(HelperTestBase):
     """The landmine the feedback flagged: `scope_at` on extension-less files
@@ -1124,29 +1109,6 @@ class TestWaitForResourcePublic(HelperTestBase):
             # Fast-fail: the raise happens at function entry, before
             # any timer setup or polling.
             self.assertEqual(lines[1], "True")
-
-
-class TestPluginVersionGlobal(HelperTestBase):
-    """`__sublime_mcp_version__` is preloaded into the snippet
-    namespace so callers can assert minimum versions before driving
-    recipes that depend on newer helpers (#99). Pairs with the
-    `plugin_version` field on the response envelope.
-    """
-
-    def test_namespace_carries_plugin_version(self):
-        # Cross-reference the in-snippet global against the response
-        # envelope's `plugin_version` — both source from
-        # `SERVER_VERSION` in the same code path, so they must agree.
-        # Sidesteps the no-importable-plugin-module problem (ST
-        # namespaces plugin files under a package name that isn't
-        # a Python identifier here).
-        code = "print(__sublime_mcp_version__)\n"
-        resp = yield from _call_tool_yielding(code)
-        outcome = _outcome(resp)
-        self.assertIsNone(outcome["error"], outcome.get("error"))
-        namespace_version = outcome["output"].strip()
-        self.assertTrue(namespace_version)
-        self.assertEqual(namespace_version, outcome["plugin_version"])
 
 
 class TestRunInlineSyntaxTest(HelperTestBase):
