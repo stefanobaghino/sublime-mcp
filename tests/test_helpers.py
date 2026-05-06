@@ -1560,6 +1560,7 @@ class TestProbeScopes(HelperTestBase):
         self.assertIsNone(outcome["error"], outcome.get("error"))
         r = json.loads(outcome["output"])
         self.assertEqual(r["syntax"], self.PYTHON_SYNTAX)
+        self.assertEqual(r["requested_syntax"], self.PYTHON_SYNTAX)
         self.assertEqual(r["resolved_syntax"], self.PYTHON_SYNTAX)
         self.assertEqual(r["view_size"], len("x = 1\n"))
         # JSON stringifies the int keys on the wire.
@@ -1591,6 +1592,7 @@ class TestProbeScopes(HelperTestBase):
             r["syntax"].endswith("/Probe.sublime-syntax"),
             "expected Probe.sublime-syntax basename, got %r" % r["syntax"],
         )
+        self.assertEqual(r["requested_syntax"], r["syntax"])
         self.assertEqual(r["resolved_syntax"], r["syntax"])
         self.assertIn("keyword.smps", r["scopes"]["0"],
                       "synthetic scope did not surface: %r" % r["scopes"])
