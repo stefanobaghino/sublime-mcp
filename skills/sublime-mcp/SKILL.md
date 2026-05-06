@@ -41,6 +41,8 @@ Common boot-time failures the harness signals on stderr (look for `ERROR  [harne
 
 Steady-state failures (timeout, hang, surprising scope) have their own diagnostic surface — see §1.1 below.
 
+**Plugin/skill drift.** This skill text is bundled with the plugin in the same repo, but the two ship through independent channels — the skill update can land before the channel snapshot of `sublime_mcp.py` does. If a recipe references a helper not in your snippet namespace, the in-container plugin is older than this skill. The running plugin version is exposed two ways: `__sublime_mcp_version__` is preloaded into the snippet namespace, and `plugin_version` is echoed on every response envelope alongside `st_version` / `st_channel`. Assert with `assert __sublime_mcp_version__ >= "<min>"` against the minimum version noted in the helper's docstring or originating issue (#99).
+
 Do not attempt to fall back to manual ST UI inspection without first telling the user the skill cannot run.
 
 ## 1.1 Reading the unified log stream
@@ -112,12 +114,13 @@ If borderline, say which way you're leaning in one sentence, then proceed.
 `mcp__sublime-text__exec_sublime_python({ code, timeout_seconds? })` runs `code` on a dedicated daemon thread inside the containerised ST's plugin host (Python 3.8) and returns:
 
 ```json
-{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "container_id": "<docker cid>", "workspace_path": "/work", "isError": false }
+{ "output": "<captured print()>", "result": "<repr(_) or null>", "error": "<traceback or null>", "st_version": 4200, "st_channel": "stable", "plugin_version": "0.1.0", "container_id": "<docker cid>", "workspace_path": "/work", "isError": false }
 ```
 
 - A trailing bare expression is auto-lifted into `_`, or assign to `_` explicitly at top level. Either way, `repr(_)` is returned as `result`.
 - `error` is populated on uncaught exception; `isError` is derived from `error is not None`. Helper failures (e.g. `run_syntax_tests` cannot complete the run) raise and surface in this same `error` field — there is no separate helper-level error channel.
 - `st_version` (int) and `st_channel` (str, e.g. `"stable"` / `"dev"`) echo the running ST build on every response. Use these to detect channel mismatches when probing grammars whose CI gates on a non-stable channel.
+- `plugin_version` (str, e.g. `"0.1.0"`) echoes this plugin's `SERVER_VERSION` on every response. The same value is preloaded into the snippet namespace as `__sublime_mcp_version__` — pair the two to detect drift between this skill and the channel-snapshot `sublime_mcp.py` (#99).
 - `container_id` is the Docker short cid of the harness container handling the call. When recovery requires `docker kill` / `docker exec`, use this field rather than `docker ps --filter label=sublime-mcp-harness -q` (which lists *every* harness container on the host — multiple Claude Code sessions can run concurrently).
 - `workspace_path` is the in-container mount root paths resolve against — always `/work` when the user followed the install instructions. Treat it as the contract anchor: every path argument you pass to `scope_at` / `run_syntax_tests` / `open_view` is interpreted against this root.
 - Optional `timeout_seconds` (clamped to `[0.1, 60.0]`) lowers the 60 s ceiling for a single call. On expiry the response carries `error: "snippet exceeded the per-call timeout of <X>s"`, distinct from the transport-ceiling `error: "exec timed out after 60.0s"`. Use it for adversarial probes where a hang is the probe's answer ("does ST loop on this regex?") so the round-trip cost is the override budget rather than the full 60 s.
@@ -135,7 +138,7 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 `mcp__sublime-text__health_check({})` is a worker-thread-only probe that detects when ST's main thread is wedged. It returns within ~2.5s regardless of main-thread state and never goes near the 60s `exec_sublime_python` ceiling. Response shape:
 
 ```json
-{ "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "workspace_path": "/work", "st_version": 4200, "st_channel": "stable" }
+{ "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "workspace_path": "/work", "st_version": 4200, "st_channel": "stable", "plugin_version": "0.1.0" }
 ```
 
 **Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Ask the user to restart the container; do not retry. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
