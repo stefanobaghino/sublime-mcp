@@ -283,6 +283,8 @@ assert sublime.find_syntax_by_scope("source.guest"), "guest never registered"
 # now resolve_position / probe_scopes against the host see the guest's scopes.
 ```
 
+`sublime.find_syntax_by_scope(scope)` returns `list[Syntax]` (typically empty or single-element), not a single `Syntax` (#111). Truthy-context use as the registration gate above works either way; if you need to read attributes off the result (e.g. `.path`), index `[0]` first.
+
 ### Confirm which syntax ST assigned (and handle repo-local syntaxes)
 
 `view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
