@@ -30,6 +30,8 @@ jobs:
           load: true
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Run image-tag derivation tests
+        run: python3 tests/test_image_tag.py
       - name: Run harness smoke test
         run: python3 tests/test_harness_smoke.py
       - name: Run unified-log shape test

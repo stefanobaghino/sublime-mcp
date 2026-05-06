@@ -33,7 +33,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-DEFAULT_IMAGE_TAG = "sublime-mcp-harness:latest"
+IMAGE_REPO = "sublime-mcp-harness"
+# Build-time label key applied to every image we build, so cleanup can
+# target this project's images precisely:
+#   docker images --filter "label=sublime-mcp-harness-image" -q
+# Distinct from the *container* label `sublime-mcp-harness=<pid>`
+# applied by `run_container`, which serves a different purpose.
+IMAGE_LABEL_KEY = "sublime-mcp-harness-image"
 CONTAINER_PORT = 47823
 CONTAINER_LICENSE_DIR = "/root/.config/sublime-text/Local"
 READINESS_TIMEOUT_S = 60.0
@@ -129,13 +135,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-tag",
-        default=DEFAULT_IMAGE_TAG,
-        help="Image tag to look up / build. Default: %(default)s",
+        default=None,
+        help="Override the image tag. Default: derived from "
+             "`git rev-parse HEAD` against the harness checkout as "
+             "`sublime-mcp-harness:<sha12>`. The harness refuses to run "
+             "when the source isn't a git repo or its work tree is dirty; "
+             "passing this flag bypasses both checks.",
     )
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="Force `docker build` even if the image already exists.",
+        help="Force `docker build` even if an image with the resolved "
+             "tag already exists. Useful only to recover from a "
+             "corrupted local image cache.",
     )
     parser.add_argument(
         "--license-file",
@@ -221,6 +233,50 @@ def stage_build_context(src: Path) -> Path:
 
 
 # ---------------------------------------------------------------------
+# Git-derived image tag
+
+
+def derive_image_tag(src: Path) -> str:
+    """Return `sublime-mcp-harness:<git-sha12>` for the harness checkout at `src`.
+
+    Refuses if `src` isn't inside a git work tree or the work tree is
+    dirty (any staged, unstaged, or untracked change). The tag must
+    unambiguously identify a committed state. Pass `--image-tag` to
+    bypass both checks.
+    """
+    inside = subprocess.run(
+        ["git", "-C", str(src), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+    )
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        raise RuntimeError(
+            "harness source at %s is not a git repository — "
+            "pass --image-tag to override or run from a clone of the "
+            "sublime-mcp source repo" % src
+        )
+    status = subprocess.run(
+        ["git", "-C", str(src), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if status.stdout.strip():
+        raise RuntimeError(
+            "harness source at %s has uncommitted changes — "
+            "commit or stash before running, or pass --image-tag to "
+            "override.\nDirty paths:\n%s" % (src, status.stdout.rstrip())
+        )
+    head = subprocess.run(
+        ["git", "-C", str(src), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return "%s:%s" % (IMAGE_REPO, head.stdout.strip()[:12])
+
+
+# ---------------------------------------------------------------------
 # Docker calls
 
 
@@ -264,7 +320,12 @@ def image_exists(tag: str) -> bool:
 def build_image(tag: str, context: Path) -> None:
     logger.info("building image %s (this can take a few minutes on first run)…", tag)
     subprocess.run(
-        ["docker", "build", "-t", tag, str(context)],
+        [
+            "docker", "build",
+            "--label", "%s=%s" % (IMAGE_LABEL_KEY, tag),
+            "-t", tag,
+            str(context),
+        ],
         check=True,
     )
     logger.info("image %s built", tag)
@@ -658,8 +719,18 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         return 2
 
+    if args.image_tag is None:
+        try:
+            tag = derive_image_tag(ctx)
+        except RuntimeError as exc:
+            logger.error("%s", exc)
+            return 2
+        logger.info("derived image tag %s from git HEAD", tag)
+    else:
+        tag = args.image_tag
+
     try:
-        ensure_image(args.image_tag, args.rebuild, ctx)
+        ensure_image(tag, args.rebuild, ctx)
     except subprocess.CalledProcessError as exc:
         logger.error("docker build failed (exit %d)", exc.returncode)
         return exc.returncode or 1
@@ -667,7 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     container_name = _container_name(args.agent_name, args.session_id)
     try:
         cid = run_container(
-            args.image_tag, args.mount, args.license_file, args.log_level,
+            tag, args.mount, args.license_file, args.log_level,
             name=container_name,
         )
     except subprocess.CalledProcessError as exc:

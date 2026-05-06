@@ -117,9 +117,14 @@ sublime-mcp --agent-name AGENT --session-id UUID
   `[A-Za-z0-9-]{1,64}`. Used to name the container.
 - `--mount HOST:CONTAINER` (repeatable): bind-mount HOST into the
   container at CONTAINER. Recommended: `--mount $PWD:/work`.
-- `--image-tag TAG`: override the image tag (default
-  `sublime-mcp-harness:latest`).
-- `--rebuild`: force `docker build` even if the image already exists.
+- `--image-tag TAG`: override the image tag. Default: derived from
+  `git rev-parse HEAD` against the harness checkout as
+  `sublime-mcp-harness:<sha12>`. The harness refuses to run when the
+  source isn't a git repo or the work tree is dirty (any staged,
+  unstaged, or untracked change) — pass `--image-tag` to bypass.
+- `--rebuild`: force `docker build` even if an image with the resolved
+  tag already exists. Useful only to recover from a corrupted local
+  image cache.
 - `--license-file PATH`: mount a Sublime Text license file into the
   container's `~/.config/sublime-text/Local/`.
 
@@ -191,5 +196,8 @@ the harness is the supported user path.
 ```sh
 claude mcp remove sublime-text --scope user
 uv tool uninstall sublime-mcp-harness
-docker image rm sublime-mcp-harness:latest
+docker images --filter "label=sublime-mcp-harness-image" -q | xargs -r docker image rm
 ```
+
+Pre-`v0.1.x`-upgrade users may also have a stale `sublime-mcp-harness:latest`;
+remove it with `docker image rm sublime-mcp-harness:latest 2>/dev/null` if so.

@@ -89,9 +89,13 @@ def run() -> int:
         return 0
 
     # `python -u` keeps stdout/stderr unbuffered so we see ready promptly.
+    # `--image-tag sublime-mcp-harness:latest` matches the tag CI's
+    # pre-build step uses; a clean checkout would otherwise resolve a
+    # different (git-derived) tag and trigger a redundant build here.
     proc = subprocess.Popen(
         [
             sys.executable, "-u", str(HARNESS),
+            "--image-tag", "sublime-mcp-harness:latest",
             "--agent-name", "harness-smoke",
             "--session-id", str(uuid.uuid4()),
         ],
