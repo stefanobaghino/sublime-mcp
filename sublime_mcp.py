@@ -765,6 +765,29 @@ def scope_at_test(path, row, col):
     point = view.text_point(row, col)
     resolved = _resolved_syntax_with_op_race_mitigation(view, resource_path)
     scope = view.scope_name(point).rstrip()
+    # Symmetric post-assign race (#94): `view.syntax()` / settings have
+    # latched the assigned syntax, but `view.scope_name(point)` still
+    # returns "text.plain" because tokenisation hasn't reached this
+    # point. Stage 2 of `assign_syntax_and_wait` waits for
+    # `scope_name(0)`; points past 0 can lag. Mirror stage 2's poll
+    # shape (50 Hz / 200 ms, scope_name only — no `view.syntax()`
+    # re-read; the latter wedged macOS run-tests on PR #92's previous
+    # shapes for unclear reasons). Inlined rather than extracted so we
+    # don't introduce a helper-invocation pattern that the PR #92
+    # bisect implicated, however weakly. Persistent `text.plain` past
+    # the budget under a non-plain syntax is the silent-fallback shape
+    # #78 will eventually surface, not a transient race.
+    if (
+        scope == "text.plain"
+        and resolved is not None
+        and resolved != "Packages/Text/Plain text.tmLanguage"
+    ):
+        deadline = _time.time() + 0.2
+        while _time.time() < deadline:
+            _time.sleep(0.02)
+            scope = view.scope_name(point).rstrip()
+            if scope != "text.plain":
+                break
     if resolved != resource_path:
         _log.warning(
             "scope_at_test silent fallback: requested=%r resolved=%r",
@@ -812,6 +835,23 @@ def resolve_position(path, row, col, syntax_path=None):
         syntax = view.syntax()
         resolved = syntax.path if syntax is not None else None
     scope = view.scope_name(point).rstrip()
+    # Symmetric post-assign race (#94): only fires on the syntax_path
+    # branch, since the no-syntax branch never assigned. See the same
+    # comment block on `scope_at_test` above for the wedge-boundary
+    # rationale (no `view.syntax()` re-read, no helper extraction,
+    # 50 Hz / 200 ms shape mirrors `assign_syntax_and_wait` stage 2).
+    if (
+        syntax_path is not None
+        and scope == "text.plain"
+        and resolved is not None
+        and resolved != "Packages/Text/Plain text.tmLanguage"
+    ):
+        deadline = _time.time() + 0.2
+        while _time.time() < deadline:
+            _time.sleep(0.02)
+            scope = view.scope_name(point).rstrip()
+            if scope != "text.plain":
+                break
     if syntax_path is not None and resolved != syntax_path:
         _log.warning(
             "resolve_position silent fallback: requested=%r resolved=%r",

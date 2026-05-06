@@ -1688,34 +1688,36 @@ class TestResolvePositionFilesystemSyntax(HelperTestBase):
     sys.platform == "darwin",
     "previous attempts at a producer-side retry helper wedged macOS "
     "run-tests for unclear reasons (no per-test output streamed for 5+ min "
-    "before cancel); the OP-direction race that this regression covers was "
-    "characterised against the production Linux/Docker harness, which is "
-    "what the test guards. The current settings-substitution mitigation in "
-    "`sublime_mcp.py` is single-shot and does not exercise the wedge path, "
-    "but skipping here keeps macOS run-tests fast and is parallel to the "
-    "existing skip pattern.",
+    "before cancel); the races this regression covers were characterised "
+    "against the production Linux/Docker harness, which is what the test "
+    "guards. The OP-direction `view.settings()['syntax']` substitution and "
+    "the symmetric-direction `view.scope_name(point)` poll in `sublime_mcp.py` "
+    "are both designed to stay outside the wedge boundary (no `view.syntax()` "
+    "re-read; the scope_name poll mirrors `assign_syntax_and_wait` stage 2's "
+    "shipped shape), but skipping here keeps macOS run-tests fast and is "
+    "parallel to the existing skip pattern. Removing this skip is tracked as "
+    "a separate verification step on the same branch.",
 )
 class TestResolvePositionPostAssignRace(HelperTestBase):
-    """`resolve_position` absorbs the OP direction of #70's post-assign
-    race against a fresh synthetic syntax: `view.syntax()` returns `None`
-    while `view.scope_name(...)` already returns the latched scope chain.
-    SKILL.md §4's strict `resolved_syntax == requested_syntax` assertion
-    spuriously fails in that direction without the mitigation.
+    """`resolve_position` absorbs both directions of #70/#94's post-assign
+    race against a fresh synthetic syntax. The OP direction (`view.syntax()`
+    returns `None` while `view.scope_name(...)` already latched) is
+    absorbed by `_resolved_syntax_with_op_race_mitigation`'s
+    `view.settings()["syntax"]` substitution. The symmetric direction
+    (`view.scope_name(point)` returns `text.plain` while `view.syntax()`
+    has latched the assigned syntax — observed at #94) is absorbed by an
+    inline `view.scope_name(point)`-only poll inside `resolve_position`,
+    mirroring `assign_syntax_and_wait` stage 2's shape (50 Hz / 200 ms,
+    no `view.syntax()` re-read — that's the wedge boundary surfaced by
+    PR #92's bisect).
 
-    The mitigation is a single-shot substitution in `sublime_mcp.py`'s
-    `_resolved_syntax_with_op_race_mitigation`: when `view.syntax()` is
-    `None` after `assign_syntax_and_wait` returns, fall back to
-    `view.settings()["syntax"]` (which stage 1 of `assign_syntax_and_wait`
-    has already validated against the requested URI). No polling, no
-    sleep — keeping the wedge-prone retry shapes out of the call path.
-
-    This regression loops `resolve_position` against a fresh
-    `temp_packages_link`-installed syntax, opens a fresh view per call,
-    and asserts every envelope satisfies `resolved_syntax ==
-    requested_syntax`. Without the mitigation the OP race tends to
-    surface in at least one iteration. The symmetric direction
-    (`view.scope_name(point)` lagging) is not asserted here — that one
-    is documented as a known issue.
+    SKILL.md §4's strict `resolved_syntax == requested_syntax` plus
+    `scope != "text.plain"` is the contract callers learned. The OP
+    direction makes the equality assertion *spuriously fail*; the
+    symmetric direction makes it *spuriously pass* while the scope is
+    `text.plain` — silent and worse. This regression loops
+    `resolve_position` against a fresh `temp_packages_link`-installed
+    syntax, opens a fresh view per call, and asserts both halves.
     """
 
     SYNTAX_CONTENT = (
@@ -1753,12 +1755,18 @@ class TestResolvePositionPostAssignRace(HelperTestBase):
                 except OSError:
                     pass
 
-    def test_op_race_resolved_matches_requested(self):
+    def test_both_race_directions_absorbed(self):
         # N=10 iterations, each opens a fresh fixture view and reads col
         # 0 of "x ...". Each call goes through the post-assign race
-        # window. Assertion: every envelope satisfies
-        # `resolved_syntax == requested_syntax` — the contract SKILL.md
-        # §4 documents and the OP race violates without the mitigation.
+        # window. Assertions per envelope:
+        # - `resolved_syntax == requested_syntax` — the OP direction;
+        #   without the settings-substitution mitigation, `view.syntax()`
+        #   lag makes this spuriously fail.
+        # - `scope != "text.plain"` — the symmetric direction;
+        #   without the inline scope_name poll, `view.scope_name(0)` can
+        #   lag behind `view.syntax()` and return `text.plain` while the
+        #   syntax setting matches, making the equality above
+        #   spuriously pass on top of bogus ground truth.
         # The fixture filename intentionally omits the `.smrace`
         # extension the syntax declares: with that extension, ST's
         # resource indexer would auto-assign the syntax on view-open
@@ -1792,6 +1800,11 @@ class TestResolvePositionPostAssignRace(HelperTestBase):
             self.assertEqual(
                 r["resolved_syntax"], r["requested_syntax"],
                 "OP race not absorbed (view.syntax() lag leaked through): %r" % r,
+            )
+            self.assertNotEqual(
+                r["scope"], "text.plain",
+                "symmetric race not absorbed "
+                "(view.scope_name(0) returned text.plain under a non-plain syntax): %r" % r,
             )
 
 
