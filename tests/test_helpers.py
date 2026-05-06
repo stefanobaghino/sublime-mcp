@@ -1430,6 +1430,206 @@ class TestTempPackagesLink(HelperTestBase):
         self.assertFalse(os.path.lexists(stale_link))
 
 
+class TestProbeScopes(HelperTestBase):
+    """`probe_scopes` opens a scratch view, assigns a syntax (existing
+    `Packages/...` URI or synthesised inline from `syntax_yaml`),
+    appends `content`, sweeps `view.scope_name(p)` at every point (or
+    just `points`), captures tokens, tears down. Composes
+    `temp_packages_link` / `assign_syntax_and_wait` / `run_on_main`
+    plus the post-#94 symmetric-race warm-up; closes the
+    `Packages/User/` synthetic-syntax leak observed on #63's follow-up
+    comment (2026-05-04).
+    """
+
+    SYNTHETIC_YAML = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: SublimeMcpProbeScopes\n"
+        "scope: source.smps\n"
+        "file_extensions: [smps]\n"
+        "version: 2\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: 'x'\n"
+        "      scope: keyword.smps\n"
+    )
+
+    PYTHON_SYNTAX = "Packages/Python/Python.sublime-syntax"
+
+    def _defensive_temp_sweep(self):
+        # Same shape as TestRunInlineSyntaxTest's stale-dir cleanup:
+        # any leftover nonce-named temp dir under Packages/User/ gets
+        # removed regardless of age, so a crash in a prior test doesn't
+        # poison this one. Probe.sublime-syntax at the root of
+        # Packages/User/ is the legacy-leak shape — sweep it too.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        try:
+            entries = os.listdir(user_dir)
+        except OSError:
+            return
+        for name in entries:
+            full = os.path.join(user_dir, name)
+            if name.startswith("__sublime_mcp_temp_") and name.endswith("__"):
+                shutil.rmtree(full, ignore_errors=True)
+            elif name.startswith("Probe.sublime-syntax"):
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+
+    def _user_temp_dir_count(self):
+        # Counts `Packages/User/__sublime_mcp_temp_*__/` — the
+        # `_new_temp_dir`-managed dirs probe_scopes uses for the
+        # syntax_yaml branch. Should return to baseline after each
+        # call; a non-zero delta is a regression in the helper's
+        # `finally`.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        try:
+            entries = os.listdir(user_dir)
+        except OSError:
+            return 0
+        return sum(
+            1
+            for e in entries
+            if e.startswith("__sublime_mcp_temp_") and e.endswith("__")
+        )
+
+    def _user_root_probe_count(self):
+        # Defensive cleanup probe for the legacy-leak shape: the
+        # original manual recipe wrote to
+        # `Packages/User/Probe.sublime-syntax` (root of Packages/User/)
+        # and failed to clean up on probe failure (#63 follow-up,
+        # 2026-05-04). probe_scopes writes inside a managed temp dir,
+        # so this count should always stay at zero.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        try:
+            entries = os.listdir(user_dir)
+        except OSError:
+            return 0
+        return sum(1 for e in entries if e.startswith("Probe.sublime-syntax"))
+
+    def _view_count(self):
+        return sum(len(w.views()) for w in sublime.windows())
+
+    def setUp(self):
+        self._defensive_temp_sweep()
+
+    def test_bundled_syntax_sweep(self):
+        before_views = self._view_count()
+        code = (
+            "import json\n"
+            "r = probe_scopes(\n"
+            "    'x = 1\\n',\n"
+            "    syntax_path=%r,\n"
+            ")\n"
+            "print(json.dumps(r))\n"
+        ) % self.PYTHON_SYNTAX
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertEqual(r["syntax"], self.PYTHON_SYNTAX)
+        self.assertEqual(r["resolved_syntax"], self.PYTHON_SYNTAX)
+        self.assertEqual(r["view_size"], len("x = 1\n"))
+        # JSON stringifies the int keys on the wire.
+        self.assertIn("0", r["scopes"])
+        self.assertIn("source.python", r["scopes"]["0"])
+        self.assertGreater(len(r["tokens"]), 0)
+        for tok in r["tokens"]:
+            self.assertEqual(set(tok.keys()), {"region", "text", "scope"})
+        self.assertEqual(self._view_count(), before_views)
+
+    def test_synthetic_syntax_sweep_and_cleanup(self):
+        before_temps = self._user_temp_dir_count()
+        before_root_probes = self._user_root_probe_count()
+        before_views = self._view_count()
+        code = (
+            "import json\n"
+            "r = probe_scopes('x = 1\\n', syntax_yaml=%r)\n"
+            "print(json.dumps(r))\n"
+        ) % self.SYNTHETIC_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertTrue(
+            r["syntax"].startswith("Packages/User/__sublime_mcp_temp_"),
+            "expected synthesised URI under managed temp dir, got %r" % r["syntax"],
+        )
+        self.assertTrue(
+            r["syntax"].endswith("/Probe.sublime-syntax"),
+            "expected Probe.sublime-syntax basename, got %r" % r["syntax"],
+        )
+        self.assertEqual(r["resolved_syntax"], r["syntax"])
+        self.assertIn("keyword.smps", r["scopes"]["0"],
+                      "synthetic scope did not surface: %r" % r["scopes"])
+        # Cleanup invariants: temp dir gone, no Probe.sublime-syntax
+        # leaked into Packages/User/ root, no view leaked.
+        self.assertEqual(self._user_temp_dir_count(), before_temps)
+        self.assertEqual(self._user_root_probe_count(), before_root_probes)
+        self.assertEqual(self._view_count(), before_views)
+
+    def test_points_subset(self):
+        before_views = self._view_count()
+        code = (
+            "import json\n"
+            "r = probe_scopes(\n"
+            "    'x = 1\\n',\n"
+            "    syntax_path=%r,\n"
+            "    points=[0, 3],\n"
+            ")\n"
+            "print(json.dumps(r))\n"
+        ) % self.PYTHON_SYNTAX
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertEqual(set(r["scopes"].keys()), {"0", "3"})
+        self.assertEqual(self._view_count(), before_views)
+
+    def test_rstrip_scopes_false_preserves_trailing_space(self):
+        before_views = self._view_count()
+        code = (
+            "import json\n"
+            "r = probe_scopes(\n"
+            "    'x = 1\\n',\n"
+            "    syntax_path=%r,\n"
+            "    rstrip_scopes=False,\n"
+            ")\n"
+            "print(json.dumps(r))\n"
+        ) % self.PYTHON_SYNTAX
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        # ST returns scope strings with a trailing space; at least one
+        # sweep entry should preserve it when rstrip_scopes=False.
+        self.assertTrue(
+            any(s.endswith(" ") for s in r["scopes"].values()),
+            "expected at least one scope to retain trailing space when "
+            "rstrip_scopes=False, got %r" % r["scopes"],
+        )
+        self.assertEqual(self._view_count(), before_views)
+
+    def test_rejects_both_syntax_args(self):
+        code = (
+            "probe_scopes('x', syntax_path=%r, syntax_yaml=%r)\n"
+        ) % (self.PYTHON_SYNTAX, self.SYNTHETIC_YAML)
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ValueError", outcome["error"])
+        self.assertIn("exactly one", outcome["error"])
+
+    def test_rejects_neither_syntax_arg(self):
+        code = "probe_scopes('x')\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ValueError", outcome["error"])
+        self.assertIn("exactly one", outcome["error"])
+
+
 class TestFindResources(HelperTestBase):
     """`find_resources` is a thin wrap of `sublime.find_resources`. A
     smoke test against a known bundled resource is sufficient — the
