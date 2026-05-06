@@ -1539,12 +1539,6 @@ class TestProbeScopes(HelperTestBase):
             self.assertEqual(set(tok.keys()), {"region", "text", "scope"})
         self.assertEqual(self._view_count(), before_views)
 
-    @unittest.skipIf(
-        sys.platform == "darwin",
-        "synthetic-syntax case sequences after PR #95 → #96: ship the "
-        "bundled-syntax regression first, unskip after macOS run-tests "
-        "confirms no wedge.",
-    )
     def test_synthetic_syntax_sweep_and_cleanup(self):
         before_temps = self._user_temp_dir_count()
         before_root_probes = self._user_root_probe_count()
