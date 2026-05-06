@@ -1511,14 +1511,23 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
     # is itself inside the Packages tree. The `syntax_path` path
     # takes either a `Packages/...` URI or a filesystem path under
     # `sublime.packages_path()`, routed through `_to_resource_path`
-    # so the returned `syntax` field echoes the URI ST actually saw.
+    # so the returned `requested_syntax` echoes the canonical URI
+    # passed to `view.assign_syntax`.
     #
     # Returns
     #   {"scopes": {int: str, ...},
     #    "tokens": [{"region": [a, b], "text": str, "scope": str}, ...],
     #    "view_size": int,
     #    "syntax": str,
+    #    "requested_syntax": str,
     #    "resolved_syntax": str | None}
+    #
+    # `requested_syntax` is the canonical `Packages/...` URI passed
+    # to `view.assign_syntax` (#119) — same shape and semantics as the
+    # `requested_syntax` echoed by `scope_at_test` and
+    # `resolve_position`, enabling the uniform silent-fallback guard
+    # `assert r["requested_syntax"] == r["resolved_syntax"]`. `syntax`
+    # is retained as an alias for back-compat.
     #
     # `scopes` is keyed by integer point. JSON serialisation will
     # stringify the keys on the wire — a snippet that does
@@ -1676,6 +1685,7 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
             "tokens": tokens,
             "view_size": view.size(),
             "syntax": syntax_uri,
+            "requested_syntax": syntax_uri,
             "resolved_syntax": resolved,
         }
     finally:
