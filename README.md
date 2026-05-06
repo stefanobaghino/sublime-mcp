@@ -118,10 +118,12 @@ sublime-mcp --agent-name AGENT --session-id UUID
 - `--mount HOST:CONTAINER` (repeatable): bind-mount HOST into the
   container at CONTAINER. Recommended: `--mount $PWD:/work`.
 - `--image-tag TAG`: override the image tag. Default: derived from
-  `git rev-parse HEAD` against the harness checkout as
-  `sublime-mcp-harness:<sha12>`. The harness refuses to run when the
-  source isn't a git repo or the work tree is dirty (any staged,
-  unstaged, or untracked change) — pass `--image-tag` to bypass.
+  `git rev-parse HEAD` against the harness checkout —
+  `sublime-mcp-harness:<sha12>` when the work tree is clean, or
+  `sublime-mcp-harness:<sha12>-dirty` (with a forced rebuild from the
+  current work tree) when there are staged, unstaged, or untracked
+  changes. The harness still refuses to run when the source isn't a
+  git repo at all — pass `--image-tag` to bypass.
 - `--rebuild`: force `docker build` even if an image with the resolved
   tag already exists. Useful only to recover from a corrupted local
   image cache.
