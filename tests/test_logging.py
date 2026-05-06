@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import unittest
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -70,7 +71,11 @@ def _spawn_harness(
     full_env["PYTHONUNBUFFERED"] = "1"
     if env:
         full_env.update(env)
-    cmd = [sys.executable, "-u", str(HARNESS)]
+    cmd = [
+        sys.executable, "-u", str(HARNESS),
+        "--agent-name", "test-logging",
+        "--session-id", str(uuid.uuid4()),
+    ]
     if extra_args:
         cmd.extend(extra_args)
     return subprocess.Popen(

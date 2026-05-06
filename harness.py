@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,26 @@ logger = logging.getLogger("sublime_mcp.harness")
 # Argument parsing
 
 
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_AGENT_NAME_SUB = re.compile(r"[^a-z0-9-]+")
+CONTAINER_NAME_MAX = 253  # Docker container name limit.
+
+
+def _sanitize_agent_name(name: str) -> str:
+    """Lowercase + collapse non-`[a-z0-9-]` runs into a single `-`."""
+    cleaned = _AGENT_NAME_SUB.sub("-", name.lower())
+    return cleaned.strip("-")
+
+
+def _container_name(agent: str, session_id: str) -> str:
+    """Build `st-<agent>-<session-id>`, truncating agent if name is too long."""
+    name = "st-%s-%s" % (agent, session_id)
+    if len(name) > CONTAINER_NAME_MAX:
+        budget = CONTAINER_NAME_MAX - len("st--") - len(session_id)
+        name = "st-%s-%s" % (agent[:max(budget, 1)], session_id)
+    return name
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="sublime-mcp",
@@ -128,6 +149,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Logging level for harness + bridge (also $SUBLIME_MCP_LOG_LEVEL). "
              "Default: %(default)s.",
     )
+    parser.add_argument(
+        "--agent-name",
+        required=True,
+        metavar="AGENT",
+        help="Name of the Claude Code agent owning this session. "
+             "Used to name the container as st-<agent>-<session-id>.",
+    )
+    parser.add_argument(
+        "--session-id",
+        required=True,
+        metavar="UUID",
+        help="Claude Code session UUID. Used to name the container.",
+    )
     args = parser.parse_args(argv)
     if args.log_level not in LOG_LEVELS:
         parser.error("--log-level must be one of %s, got %r" % (LOG_LEVELS, args.log_level))
@@ -136,6 +170,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("--mount expects HOST:CONTAINER, got %r" % spec)
     if args.license_file and not Path(args.license_file).is_file():
         parser.error("--license-file %r is not a regular file" % args.license_file)
+    sanitized_agent = _sanitize_agent_name(args.agent_name)
+    if not sanitized_agent:
+        parser.error(
+            "--agent-name %r contains no [a-z0-9-] characters after sanitization"
+            % args.agent_name
+        )
+    args.agent_name = sanitized_agent
+    if not _SESSION_ID_RE.match(args.session_id):
+        parser.error(
+            "--session-id %r must match [A-Za-z0-9-]{1,64}" % args.session_id
+        )
     return args
 
 
@@ -252,11 +297,14 @@ def run_container(
     mounts: list[str],
     license_file: str | None,
     log_level: str = "INFO",
+    *,
+    name: str,
 ) -> str:
     args = [
         "docker", "run",
         "-d",
         "--rm",
+        "--name", name,
         "--label", "sublime-mcp-harness=%d" % os.getpid(),
         "-p", "127.0.0.1:0:%d" % CONTAINER_PORT,
         "-e", "SUBLIME_MCP_LOG_LEVEL=%s" % log_level,
@@ -616,12 +664,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("docker build failed (exit %d)", exc.returncode)
         return exc.returncode or 1
 
+    container_name = _container_name(args.agent_name, args.session_id)
     try:
-        cid = run_container(args.image_tag, args.mount, args.license_file, args.log_level)
+        cid = run_container(
+            args.image_tag, args.mount, args.license_file, args.log_level,
+            name=container_name,
+        )
     except subprocess.CalledProcessError as exc:
         logger.error("docker run failed (exit %d): %s", exc.returncode, exc.stderr or "")
         return exc.returncode or 1
-    logger.info("container started cid=%s", cid[:12])
+    logger.info("container started cid=%s name=%s", cid[:12], container_name)
 
     stop_event = threading.Event()
 

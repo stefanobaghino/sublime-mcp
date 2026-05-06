@@ -105,10 +105,16 @@ list resources. Agents should read it as their primary reference.
 ## Harness flags
 
 ```
-sublime-mcp [--mount HOST:CONTAINER] [--image-tag TAG]
+sublime-mcp --agent-name AGENT --session-id UUID
+            [--mount HOST:CONTAINER] [--image-tag TAG]
             [--rebuild] [--license-file PATH]
 ```
 
+- `--agent-name AGENT` (required): name of the agent owning this
+  session. Sanitized to `[a-z0-9-]` and used to name the container as
+  `st-<agent>-<session-id>`.
+- `--session-id UUID` (required): session identifier, matched against
+  `[A-Za-z0-9-]{1,64}`. Used to name the container.
 - `--mount HOST:CONTAINER` (repeatable): bind-mount HOST into the
   container at CONTAINER. Recommended: `--mount $PWD:/work`.
 - `--image-tag TAG`: override the image tag (default
@@ -117,13 +123,20 @@ sublime-mcp [--mount HOST:CONTAINER] [--image-tag TAG]
 - `--license-file PATH`: mount a Sublime Text license file into the
   container's `~/.config/sublime-text/Local/`.
 
+Both `--agent-name` and `--session-id` are dynamic per session;
+Claude Code's MCP launch is a static argv, so register the harness via
+a small launcher script that fills them in from the surrounding
+context (see [`skills/sublime-mcp/install.md`](skills/sublime-mcp/install.md)).
+
 ## Multi-agent
 
 Each agent session spawns its own harness; each harness owns its own
 container. Host ports are kernel-assigned, so concurrent agents on the
-same machine don't collide. `docker ps --filter
-label=sublime-mcp-harness` lists the running containers; the label
-value is the harness's PID.
+same machine don't collide. Containers are named
+`st-<agent>-<session-uuid>`, so `docker ps` directly shows which
+session owns which container. `docker ps --filter
+label=sublime-mcp-harness` is also still supported — the label value
+is the harness's PID.
 
 ## Tests
 

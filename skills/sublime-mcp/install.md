@@ -28,10 +28,23 @@ uv tool install --editable .
 
 ## Register with Claude Code
 
+The harness requires `--agent-name` and `--session-id` so each container can be named `st-<agent>-<session>` and matched back to the session that owns it. Both must come from the live agent context, so register the harness via a tiny launcher script (Claude Code's MCP launch is a static argv; it can't template per-session values directly):
+
+```bash
+# ~/.local/bin/sublime-mcp-launcher
+#!/usr/bin/env bash
+exec sublime-mcp \
+    --agent-name "${CLAUDE_AGENT_NAME:-claude-code}" \
+    --session-id "${CLAUDE_SESSION_ID:?CLAUDE_SESSION_ID must be set}" \
+    --mount "$PWD:/work" "$@"
+```
+
 ```bash
 claude mcp add --scope user --transport stdio sublime-text -- \
-    sublime-mcp --mount "$PWD:/work"
+    sublime-mcp-launcher
 ```
+
+The launcher is the place to thread agent/session info from whatever the surrounding harness exposes (env vars, hook input, etc.). The harness itself hard-fails if either flag is missing.
 
 The name `sublime-text` is load-bearing: the skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
 
@@ -65,7 +78,7 @@ The plugin host inside the container is wedged. Restart the agent session (closi
 
 ### Multi-agent: ports / containers
 
-Each agent session spawns its own harness, which spawns its own container. Host ports are kernel-assigned (`-p 127.0.0.1:0:47823`), so concurrent agents don't collide. `docker ps --filter label=sublime-mcp-harness` lists them — the label value is the harness's PID, useful for matching a container to a specific session.
+Each agent session spawns its own harness, which spawns its own container. Host ports are kernel-assigned (`-p 127.0.0.1:0:47823`), so concurrent agents don't collide. `docker ps --filter label=sublime-mcp-harness` lists them; container names are `st-<agent>-<session-uuid>`, so the agent and session that own each container are visible in `docker ps` directly. The `sublime-mcp-harness=<pid>` label is still set for backwards-compatible filtering.
 
 Each ST instance uses ~100–300 MB RAM. If you routinely run many concurrent agents, watch overall memory pressure.
 
@@ -105,7 +118,7 @@ Success: `summary` is a numeric "N assertions passed" or "FAILED: M of N asserti
 ```bash
 claude mcp remove sublime-text
 claude mcp add --scope user --transport stdio sublime-text -- \
-    sublime-mcp --mount "$PWD:/work"
+    sublime-mcp-launcher
 ```
 
 The name `sublime-text` is load-bearing: this skill's `allowed-tools` hard-codes `mcp__sublime-text__exec_sublime_python`. Registered under a different name, the skill won't see the tool.
