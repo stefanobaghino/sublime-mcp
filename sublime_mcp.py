@@ -309,9 +309,16 @@ them in `run_on_main(...)`. The following names are preloaded:
   `Packages/<name>/<basename>` to feed `assign_syntax_and_wait` /
   `resolve_position`. Replaces the manual `ln -s ...` recipe for
   repo-local syntaxes (e.g. `testdata/Packages/...` from another
-  parser's repo). For cross-grammar investigations needing the
-  whole testdata tree (cross-includes resolve to built-ins under
-  this per-syntax mode), see SKILL.md §6 follow-up.
+  parser's repo). Cross-syntax references inside a linked syntax
+  (`push:`/`set:`/`embed:`/`include:` against `scope:source.X` and
+  file-path forms) silently fall back to Plain Text inside the
+  embedded region (#108) — for cross-syntax probes, write under
+  `sublime.packages_path()/User/<subdir>/` instead and poll
+  `sublime.find_syntax_by_scope` for readiness; see SKILL.md §4
+  *Cross-syntax / multi-syntax probes*. For cross-grammar
+  investigations needing the whole testdata tree (cross-includes
+  resolve to built-ins under this per-syntax mode), see SKILL.md
+  §6 follow-up.
 
 ## text_point overflow
 
