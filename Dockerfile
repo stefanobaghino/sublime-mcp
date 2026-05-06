@@ -34,6 +34,7 @@ RUN sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|htt
         locales \
         locales-all \
         psmisc \
+        python3 \
         xvfb \
  && rm -rf /var/lib/apt/lists/*
 
@@ -61,6 +62,7 @@ COPY plugin.py /root/.config/sublime-text/Packages/User/plugin.py
 # to import silently and `plugin_loaded()` is never called.
 RUN echo "3.8" > /root/.config/sublime-text/Packages/User/.python-version
 
+COPY bridge.py /bridge.py
 COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

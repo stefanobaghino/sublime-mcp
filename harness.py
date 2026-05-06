@@ -201,14 +201,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def build_context_dir() -> Path:
-    """Locate the Dockerfile + plugin.py + entrypoint.sh.
+    """Locate the Dockerfile + plugin.py + bridge.py + entrypoint.sh.
 
     Two cases: running from a source checkout (next to harness.py) or
     installed as a package (alongside the module). In both cases the
     files sit next to this file.
     """
     here = Path(__file__).resolve().parent
-    required = ["Dockerfile", "plugin.py", "docker/entrypoint.sh"]
+    required = ["Dockerfile", "plugin.py", "bridge.py", "docker/entrypoint.sh"]
     missing = [name for name in required if not (here / name).is_file()]
     if missing:
         raise RuntimeError(
@@ -227,6 +227,7 @@ def stage_build_context(src: Path) -> Path:
     dst = Path(tempfile.mkdtemp(prefix="sublime-mcp-harness-build-"))
     shutil.copy2(src / "Dockerfile", dst / "Dockerfile")
     shutil.copy2(src / "plugin.py", dst / "plugin.py")
+    shutil.copy2(src / "bridge.py", dst / "bridge.py")
     (dst / "docker").mkdir()
     shutil.copy2(src / "docker" / "entrypoint.sh", dst / "docker" / "entrypoint.sh")
     return dst
