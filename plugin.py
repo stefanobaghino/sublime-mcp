@@ -289,6 +289,16 @@ them in `run_on_main(...)`. The following names are preloaded:
   (e.g. after an external edit via symlink).
 - `find_resources(pattern) -> list[str]` — wraps
   `sublime.find_resources(pattern)`.
+- `preflight_wedge_check(yaml_text, strict=False) -> list[dict]`
+  — pre-flight static check for known-wedge synthetic-syntax
+  shapes (#103). Returns a list of `{"shape", "message", "line"}`
+  warning dicts; empty when the YAML is clean. `strict=True`
+  raises `WedgeShape` instead. Initial rule set: duplicate
+  cross-scope includes (#103 shape 2) and zero-width-only match
+  paired with push (narrow form of #103 shape 1). The lint runs
+  automatically on every `.sublime-syntax` file under a
+  `temp_packages_link` target; warnings reach the unified log
+  stream at level WARNING.
 - `dump_bytes(value) -> str` — render `value` (str / bytes /
   bytearray) as a hex digest that survives repr -> JSON cleanly
   (#115). Use inside a snippet for byte-exact questions like
@@ -950,6 +960,173 @@ def find_resources(pattern):
     return list(sublime.find_resources(pattern))
 
 
+class WedgeShape(Exception):
+    # Raised by preflight_wedge_check(yaml_text, strict=True) when at
+    # least one wedge-shape warning fired (#103). The full warnings
+    # list is on the `warnings` attribute so callers can introspect
+    # without re-running the check.
+    def __init__(self, warnings):
+        self.warnings = warnings
+        message = "preflight_wedge_check: %d wedge-shape warning%s" % (
+            len(warnings), "" if len(warnings) == 1 else "s"
+        )
+        super().__init__(message)
+
+
+_INCLUDE_SCOPE_PATTERN = _re.compile(
+    r"include\s*:\s*scope\s*:\s*([^\s#]+)(?:#[^\s]+)?"
+)
+_ZERO_WIDTH_ONLY_PATTERN = _re.compile(
+    r"\A['\"]?\(\?[=!<](?:[^()]|\([^()]*\))*\)['\"]?\Z"
+)
+
+
+def _scan_yaml_rules(yaml_text):
+    # Walk yaml_text line by line; yield (rule_lines, rule_start_line)
+    # for each list-item rule (`- key: value` block). Approximate
+    # parser tuned for sublime-syntax: detects rules by `- ` list
+    # markers and closes them on the next list marker or a dedent
+    # below the rule's indent. Doesn't handle block-scalar `match: |`
+    # or deep-nested mappings within a rule — narrow by design, same
+    # principle as the rest of preflight_wedge_check.
+    lines = yaml_text.splitlines()
+    rule_lines = []
+    rule_start = None
+    rule_indent = None
+    for i, line in enumerate(lines):
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        is_list_marker = stripped.startswith("- ") or stripped == "-"
+        if is_list_marker and (rule_indent is None or indent <= rule_indent):
+            if rule_lines:
+                yield rule_lines, rule_start
+            rule_lines = [line]
+            rule_start = i
+            rule_indent = indent
+            continue
+        if not rule_lines:
+            continue
+        if stripped == "":
+            rule_lines.append(line)
+            continue
+        if indent > rule_indent:
+            rule_lines.append(line)
+            continue
+        # Dedent below rule indent — current rule closes.
+        yield rule_lines, rule_start
+        rule_lines = []
+        rule_start = None
+        rule_indent = None
+    if rule_lines:
+        yield rule_lines, rule_start
+
+
+def _rule_keys(rule_lines):
+    # Extract top-level `key: value` pairs from a rule produced by
+    # `_scan_yaml_rules`. Approximate: splits on the first `:` per
+    # line and strips quotes around the value. Misses block scalars
+    # and any value that spans multiple lines.
+    keys = {}
+    if not rule_lines:
+        return keys
+    first = rule_lines[0].lstrip(" ")
+    if first.startswith("- "):
+        first = first[2:]
+    elif first == "-":
+        first = ""
+    if ":" in first:
+        k, _, v = first.partition(":")
+        keys[k.strip()] = v.strip()
+    for line in rule_lines[1:]:
+        stripped = line.lstrip(" ")
+        if not stripped or stripped.startswith("#") or stripped.startswith("- "):
+            continue
+        if ":" in stripped:
+            k, _, v = stripped.partition(":")
+            k = k.strip()
+            if k and k not in keys:
+                keys[k] = v.strip()
+    return keys
+
+
+def preflight_wedge_check(yaml_text, strict=False):
+    # Pre-flight static check for known-wedge synthetic-syntax shapes
+    # (#103). The class addressed: synthetic syntaxes that load
+    # cleanly (find_resources lists them, requested == resolved, no
+    # parse-table-build failure) and wedge ST's tokeniser only once
+    # a tokenising operation runs against them. Recovery (#73) and
+    # diagnostic capture (#79) both kick in too late to spare the
+    # round-trip.
+    #
+    # Returns a list of warning dicts:
+    #   [{"shape": str, "message": str, "line": int | None}, ...]
+    # Empty list when no warnings fire. `strict=True` raises
+    # WedgeShape when the list is non-empty (warnings on the
+    # exception's `warnings` attribute).
+    #
+    # Detectors are narrow by design — false-positive risk hurts
+    # adoption more than false-negative risk hurts coverage. Current
+    # rule set:
+    #
+    # - duplicate-cross-scope-include (#103 shape 2): two or more
+    #   `include: scope:<base>` entries with the same `<base>` (any
+    #   fragment, or none) in one YAML. The second resolution under
+    #   a `temp_packages_link` package wedges the tokeniser.
+    # - zero-width-match-with-push (#103 shape 1, narrow): a rule
+    #   whose `match:` value is purely a lookahead / lookbehind
+    #   expression (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`)
+    #   paired with a `push:` action. The full shape from #103
+    #   needs cross-context analysis (whether the pushed context's
+    #   first rule unconditionally consumes); this narrow form
+    #   catches a real subset without that.
+    #
+    # Shape 3 from #103 (back-to-back cross-syntax fragment includes
+    # under one temp_packages_link) is multi-file and out of single-
+    # YAML scope; left for future expansion when a multi-file lint
+    # surface is in place.
+    if not isinstance(yaml_text, str):
+        raise TypeError(
+            "preflight_wedge_check: expected str, got %s"
+            % type(yaml_text).__name__
+        )
+    warnings = []
+    bases = {}
+    for m in _INCLUDE_SCOPE_PATTERN.finditer(yaml_text):
+        bases.setdefault(m.group(1), 0)
+        bases[m.group(1)] += 1
+    for base, count in bases.items():
+        if count > 1:
+            warnings.append({
+                "shape": "duplicate-cross-scope-include",
+                "message": (
+                    "%d `include: scope:%s` entries in one syntax — "
+                    "second resolution under a temp_packages_link "
+                    "package wedges the tokeniser (#103 shape 2)"
+                ) % (count, base),
+                "line": None,
+            })
+    for rule_lines, rule_start in _scan_yaml_rules(yaml_text):
+        keys = _rule_keys(rule_lines)
+        match_value = keys.get("match")
+        if not match_value or "push" not in keys:
+            continue
+        if _ZERO_WIDTH_ONLY_PATTERN.match(match_value):
+            warnings.append({
+                "shape": "zero-width-match-with-push",
+                "message": (
+                    "rule has zero-width-only match %r paired with "
+                    "push — narrow form of #103 shape 1; even when "
+                    "the pushed context unconditionally consumes, "
+                    "this combination has wedged the tokeniser in "
+                    "the wild"
+                ) % match_value,
+                "line": rule_start + 1 if rule_start is not None else None,
+            })
+    if strict and warnings:
+        raise WedgeShape(warnings)
+    return warnings
+
+
 def dump_bytes(value):
     # Render `value` (str / bytes / bytearray) as a hex digest that
     # survives the repr -> JSON round-trip cleanly (#115). The
@@ -1437,6 +1614,35 @@ def temp_packages_link(filesystem_path, wait_timeout=3.0):
         raise RuntimeError(
             "temp_packages_link: %r is not a file or directory" % abs_path
         )
+    # Preflight wedge-shape check on every .sublime-syntax file under
+    # the target dir (#103). Warnings are logged at WARNING; the link
+    # is still created — the user knows the wedge classes and may have
+    # accepted them. `strict=True` lives on `preflight_wedge_check`
+    # itself for callers who want to abort up front.
+    try:
+        target_entries = _os.listdir(target_dir)
+    except OSError:
+        target_entries = []
+    for entry in target_entries:
+        if not entry.endswith(".sublime-syntax"):
+            continue
+        full = _os.path.join(target_dir, entry)
+        if not _os.path.isfile(full):
+            continue
+        try:
+            with open(full) as f:
+                yaml_text = f.read()
+        except OSError as exc:
+            _log.warning(
+                "temp_packages_link preflight: cannot read %r: %s",
+                full, exc,
+            )
+            continue
+        for warning in preflight_wedge_check(yaml_text):
+            _log.warning(
+                "temp_packages_link preflight (#103): %s in %r — %s",
+                warning["shape"], entry, warning["message"],
+            )
     _sweep_stale_temp_packages()
     nonce = _uuid.uuid4().hex[:12]
     name = "%s%s%s" % (_TEMP_DIR_PREFIX, nonce, _TEMP_DIR_SUFFIX)
