@@ -86,13 +86,23 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 
 ## 1.2 Capturing ST's own console output (don't bother)
 
-When ST silently rejects a `.sublime-syntax` (parse-table-build failure — see #78), it writes the parse error to its console panel. That panel is *not* reachable from inside `exec_sublime_python` via any obvious path — every approach below has been verified empty in dogfooding sessions:
+When ST silently rejects a `.sublime-syntax` (parse-table-build failure — see #78), the rejection reason is written to ST's in-memory console panel and **does not cross any syscall boundary the harness can intercept**. Every in-process and out-of-process surface has been verified empty:
+
+In-plugin-host (per [#79 comment 3](https://github.com/stefanobaghino/sublime-mcp/issues/79#issuecomment-4377608473)):
 
 - `window.find_output_panel("console")` returns `None` even when `window.panels()` lists `'console'`. `create_output_panel("console")` produces an empty View (size 0). Variants `'output.console'`, `'exec'`, `'Console'` are all empty.
 - Redirecting `sys.stdout` / `sys.stderr` over the parse-table-build window captures zero bytes.
 - `os.dup2(2, …)` over the same window also captures zero bytes.
 
-ST's loader writes its diagnostics through a path none of these reach. Don't burn a turn going through the standard-panel-API door. If your probe needs to know *why* a syntax was rejected, fall back to differential structural probing (write a known-good control alongside the suspect form, compare which one ST resolves) and surface the observation as "rejected at some layer beyond YAML parse" without naming the layer. See #79 for the open question on a usable capture path.
+Out-of-plugin-host (per the closure of #79):
+
+- All ST processes (daemon, plugin_host-3.3, plugin_host-3.8, crash_handler) have `fd 0/1/2 → /dev/null`. The container's `entrypoint.sh` redirection to `/var/log/sublime.log` is severed at daemonisation; that file stays 0 bytes. ST's own log directories (`/root/.config/sublime-text/Log/`, `/root/.cache/sublime-text/`) stay empty across probes.
+- `strace -f -p <daemon> -e trace=write,writev` across a parse-table-build trigger captures **zero writes to fd 1 or fd 2**. All write traffic is X11 protocol to Xvfb (fd 7 writev), eventfd sync counters (fd 5), and IPC pipe notifications (fd 10). An `LD_PRELOAD` shim filtered on stdio writes would catch nothing.
+- `sublime.log_*` toggles (`log_build_systems`, `log_commands`, `log_control_tree`, `log_fps`, `log_indexing`, `log_input`, `log_result_regex`) do not gate loader diagnostics.
+
+The console panel content lives entirely in the daemon's address space; reaching it requires daemon-internal access (gdb against in-memory state, or reverse-engineering the daemon↔plugin_host IPC framing on fd 3/4). Out of scope for harness-level helpers.
+
+If your probe needs to know *why* a syntax was rejected, fall back to differential structural probing (write a known-good control alongside the suspect form, compare which one ST resolves) and surface the observation as "rejected at some layer beyond YAML parse" without naming the layer. See the closed #79 for the campaign evidence; re-open with new evidence if anyone finds a syscall path missed here (`pwrite`, untraced fds, etc.).
 
 ## 2. Decide whether this skill is the right call
 
