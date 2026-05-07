@@ -272,14 +272,18 @@ them in `run_on_main(...)`. The following names are preloaded:
   / `syntax_yaml`; `syntax_path` outside the Packages tree),
   `RuntimeError` on indexing miss or content-doesn't-land within
   1 s, `TimeoutError` on syntax-assign timeout. Also raises
-  `RuntimeError` on the case-3 silent fallback from #78: ST
-  registered the syntax structurally with a non-plain declared
-  base scope, but `view.scope_name(0)` is still `text.plain` past
-  `assign_syntax_and_wait` stage 2's 200 ms poll plus an extra
-  200 ms re-poll — i.e. the parse-table builder rejected an
-  action shape ST doesn't compile (e.g. multi-target `embed:`
-  list form). The raise prevents an all-`text.plain` result from
-  being misread as the probe outcome.
+  `RuntimeError` on either of two case-3 silent-fallback shapes,
+  detected from the committed sweep output (post-#107 fix; the
+  earlier point-0-only detector misfired ~25 % of the time when
+  ST tokenisation raced the warm-up): every position bare
+  `text.plain` under a non-plain declared base (#78 / #107
+  single-syntax variant — parse-table builder rejected an action
+  shape ST doesn't compile, e.g. multi-target `embed:`), or any
+  position carrying `text.plain` as a non-leading scope element
+  (#109 embed-side variant — a `push:` / `set:` / `embed:` /
+  `include:` against another scope or file path silently fell
+  back to Plain Text). Either raise prevents the misleading
+  result from being misread as the probe outcome.
 - `reload_syntax(resource_path) -> None` — force-reloads a
   `.sublime-syntax` resource. Useful when ST cached an older version
   (e.g. after an external edit via symlink).
@@ -1626,6 +1630,56 @@ def run_inline_syntax_test(content, name):
         _shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _check_case3_silent_fallback(scopes, declared_base, syntax_uri):
+    # Sweep-time case-3 silent-fallback detector for probe_scopes.
+    # Two distinct shapes detected after the sweep has settled (rather
+    # than from a one-shot post-warm-up sample, which races — see
+    # #107):
+    #
+    # 1. Every position bare `text.plain` under a non-plain declared
+    #    base (#78 single-syntax variant, originally caught by the
+    #    point-0 check; #107 widens to the full sweep): the syntax
+    #    registered structurally but its parse-table builder rejected
+    #    something deeper, so tokenisation falls through to Plain Text
+    #    everywhere.
+    # 2. Some position carries `text.plain` as a non-leading scope
+    #    element under a non-plain declared base (#109 embed-side
+    #    variant): a `push:` / `set:` / `embed:` / `include:` action
+    #    targeted another syntax by scope or file path, ST couldn't
+    #    resolve it, the embedded frame fell back to Plain Text whose
+    #    `meta_scope` is exactly `text.plain`. The host's frame still
+    #    looks correct, so the all-plain check above doesn't catch
+    #    this — the cross-position evidence is what surfaces it.
+    #
+    # Real intentional embeds of Plain Text are vanishingly rare and
+    # would also trip this — an opt-out keyword can be added if a
+    # legitimate use case shows up.
+    if declared_base is None or declared_base.startswith("text.plain"):
+        return
+    if not scopes:
+        return
+    rstripped = {p: s.rstrip() for p, s in scopes.items()}
+    if all(s == "text.plain" for s in rstripped.values()):
+        raise RuntimeError(
+            "probe_scopes: parse-table build failed for %s "
+            "(syntax registered with declared base %r, but every "
+            "position in the sweep tokenises as text.plain; see "
+            "#78 / #107)" % (syntax_uri, declared_base)
+        )
+    for p in sorted(rstripped):
+        chain = rstripped[p].split()
+        if any(t == "text.plain" for t in chain[1:]):
+            raise RuntimeError(
+                "probe_scopes: cross-syntax fallback detected for "
+                "%s (declared base %r resolved cleanly, but "
+                "text.plain appears as a non-leading scope at "
+                "point %d in %r — a push:/set:/embed:/include: "
+                "against another scope or file path silently fell "
+                "back to Plain Text; see #108 / #109)"
+                % (syntax_uri, declared_base, p, rstripped[p])
+            )
+
+
 def probe_scopes(content, syntax_path=None, syntax_yaml=None,
                  points=None, rstrip_scopes=True):
     # Open a scratch view, assign a syntax (existing or synthesised
@@ -1677,15 +1731,24 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
     # dir; `_sweep_stale_temp_dirs` runs at the head of `_new_temp_dir`
     # / `_sweep_stale_temp_dirs` callers so SIGKILL paths are covered.
     #
-    # Raises `RuntimeError` on the case-3 silent fallback from #78:
-    # the syntax registers structurally with a non-plain declared base
-    # scope but `view.scope_name(0)` is still `text.plain` past
-    # `assign_syntax_and_wait` stage 2's 200 ms poll plus an extra
-    # 200 ms re-poll. ST accepted the YAML but its parse-table builder
-    # rejected something deeper (e.g. an action shape ST doesn't
-    # compile, like multi-target `embed:`); without the raise, the
-    # helper would silently return an all-`text.plain` result the
-    # caller would misread as their probe.
+    # Raises `RuntimeError` on case-3 silent fallback in two shapes
+    # — both detected from the committed sweep output rather than a
+    # one-shot post-warm-up sample (#107 sweep-time fix):
+    #
+    # - Single-syntax variant (#78 / #107): every position in the
+    #   sweep tokenises as bare `text.plain` despite a non-plain
+    #   declared base. ST accepted the YAML but its parse-table
+    #   builder rejected something deeper (e.g. a multi-target
+    #   `embed:`); without the raise, the helper would silently
+    #   return an all-`text.plain` result the caller would misread.
+    # - Embed-side variant (#108 / #109): some position carries
+    #   `text.plain` as a non-leading scope element under a non-plain
+    #   declared base. A `push:` / `set:` / `embed:` / `include:`
+    #   action targeted another syntax by scope or file path, ST
+    #   couldn't resolve it, the embedded frame fell back to Plain
+    #   Text whose `meta_scope` is `text.plain`. The host's frame
+    #   still looks correct; the all-plain check above doesn't catch
+    #   this.
     if (syntax_path is None) == (syntax_yaml is None):
         raise ValueError(
             "probe_scopes: exactly one of syntax_path / syntax_yaml required"
@@ -1740,40 +1803,15 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
             )
 
         resolved = _resolved_syntax_with_op_race_mitigation(view, syntax_uri)
-        # Case-3 health check (#78). `assign_syntax_and_wait` stage 2
-        # already polled `view.scope_name(0)` for 200 ms waiting for it
-        # to change from pre-assign. If after that it's still
-        # `text.plain` and the registered syntax declares a non-plain
-        # base, ST accepted the YAML structurally but its parse-table
-        # builder rejected something deeper. Re-poll once for race
-        # tolerance (in case stage 2 fell through under load), then
-        # raise if still stuck. Detection at point 0 specifically — not
-        # the tail — so race tolerance at the warm point below stays
-        # decoupled from health-checking.
+        # Resolve the declared base scope from the syntax ST actually
+        # loaded. Used by the post-sweep case-3 detector below; kept
+        # here so the lookup happens once.
         syntax_obj = (
             sublime.syntax_from_path(resolved) if resolved else None
         )
         if syntax_obj is None:
             syntax_obj = view.syntax()
         declared_base = syntax_obj.scope if syntax_obj is not None else None
-        if (
-            declared_base is not None
-            and not declared_base.startswith("text.plain")
-            and view.scope_name(0).rstrip() == "text.plain"
-        ):
-            case3_deadline = _time.time() + 0.2
-            while _time.time() < case3_deadline:
-                if view.scope_name(0).rstrip() != "text.plain":
-                    break
-                _time.sleep(0.02)
-            if view.scope_name(0).rstrip() == "text.plain":
-                raise RuntimeError(
-                    "probe_scopes: parse-table build failed for %s "
-                    "(syntax registered with declared base %r, but "
-                    "tokenisation returned text.plain at point 0; "
-                    "see #78)"
-                    % (syntax_uri, declared_base)
-                )
         sweep_points = (
             list(points) if points is not None else list(range(view.size() + 1))
         )
@@ -1784,8 +1822,9 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
         # `view.syntax()` re-read, 50 Hz / 200 ms shape mirrors
         # assign_syntax_and_wait stage 2. Falls through on budget
         # exhaustion — under-CI race that hasn't converged yet returns
-        # text.plain rather than raising; case-3 is detected at point 0
-        # above, so this gate stays purely about race tolerance.
+        # text.plain rather than raising; the case-3 detector below
+        # operates on the committed sweep output (#107), so a
+        # transiently-stuck warm point doesn't translate into a misfire.
         if sweep_points:
             warm_point = max(sweep_points)
             warm = view.scope_name(warm_point).rstrip()
@@ -1806,6 +1845,7 @@ def probe_scopes(content, syntax_path=None, syntax_yaml=None,
             return s.rstrip() if rstrip_scopes else s
 
         scopes = {p: _scope(p) for p in sweep_points}
+        _check_case3_silent_fallback(scopes, declared_base, syntax_uri)
         raw_tokens = view.extract_tokens_with_scopes(
             sublime.Region(0, view.size())
         )
