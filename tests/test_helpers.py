@@ -2081,20 +2081,45 @@ class TestProbeScopesCase3Detector(HelperTestBase):
         # locate the failed embed without re-sweeping.
         self.assertIn("point 1", out)
 
-    def test_no_raise_when_declared_base_is_plain(self):
-        # If the assigned syntax is itself Plain Text, every
+    def test_no_raise_when_syntax_uri_is_plain(self):
+        # If the caller explicitly asked for Plain Text, every
         # `text.plain` reading is the expected outcome. The detector
-        # gates on a non-plain declared base; Plain Text fixtures
-        # must not trip it.
+        # gates on caller intent (`syntax_uri`), not on the resolved
+        # metadata's declared base — see the docstring comment for
+        # why declared_base alone isn't reliable here.
         code = (
             "scopes = {0: 'text.plain', 1: 'text.plain'}\n"
-            "_check_case3_silent_fallback(scopes, 'text.plain', %r)\n"
+            "_check_case3_silent_fallback("
+            "scopes, 'text.plain', 'Packages/Text/Plain text.tmLanguage')\n"
             "print('ok')\n"
-        ) % self.PROBE_URI
+        )
         resp = yield from _call_tool_yielding(code)
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         self.assertEqual(outcome["output"].strip(), "ok")
+
+    def test_raises_when_declared_base_falls_back_to_plain(self):
+        # Regression for the silent miss observed in the #79 probe
+        # campaign (2026-05-07): a multi-target `embed:` syntax
+        # registers under its requested URI, all positions tokenise
+        # as `text.plain`, but `view.syntax().scope` (and therefore
+        # `declared_base`) falls back to `text.plain` too. The old
+        # `declared_base.startswith("text.plain")` early-return then
+        # masked the case-1 fallback. Gating on `syntax_uri` instead
+        # surfaces it.
+        code = (
+            "scopes = {0: 'text.plain', 1: 'text.plain', 5: 'text.plain'}\n"
+            "try:\n"
+            "    _check_case3_silent_fallback(scopes, 'text.plain', %r)\n"
+            "except RuntimeError as e:\n"
+            "    print('raised:', str(e))\n"
+        ) % self.PROBE_URI
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        out = outcome["output"]
+        self.assertIn("parse-table build failed", out)
+        self.assertIn("#78 / #107", out)
 
     def test_no_raise_on_empty_sweep(self):
         # Empty content / empty `points` → empty scopes dict. Without

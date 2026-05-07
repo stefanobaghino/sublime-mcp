@@ -1888,7 +1888,15 @@ def _check_case3_silent_fallback(scopes, declared_base, syntax_uri):
     # Real intentional embeds of Plain Text are vanishingly rare and
     # would also trip this — an opt-out keyword can be added if a
     # legitimate use case shows up.
-    if declared_base is None or declared_base.startswith("text.plain"):
+    #
+    # Gate on `syntax_uri` (caller intent), not `declared_base`
+    # (resolved metadata). When ST silently fails to build the parse
+    # table, it registers the URI but `Syntax.scope` falls back to
+    # `text.plain` — so `declared_base.startswith("text.plain")`
+    # would mask the case-1 fallback exactly when we most want to
+    # surface it. The URI still echoes what the caller asked for, so
+    # it's the right signal for "did the caller intend Plain Text?"
+    if syntax_uri is None or syntax_uri == "Packages/Text/Plain text.tmLanguage":
         return
     if not scopes:
         return
