@@ -33,9 +33,24 @@ SERVER_STARTUP_POLL_ATTEMPTS = 30
 SERVER_STARTUP_POLL_INTERVAL_S = 0.1
 CALL_YIELD_INTERVAL_MS = 50
 
-HEADER = '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
-HEADER_PIPE_MD = '| SYNTAX TEST "Packages/Markdown/Markdown.sublime-syntax"\n'
-HEADER_HTML_COMMENT = '<!-- SYNTAX TEST "Packages/HTML/HTML.sublime-syntax" -->\n'
+def header_for(syntax_uri, *, prefix="# ", suffix=""):
+    """Build a `SYNTAX TEST` header line for `syntax_uri` (#7).
+
+    Default `prefix="# "` covers the common single-`#` comment-marker
+    syntaxes (Python, shell, YAML, …); pass `prefix="| "` for
+    Markdown's pipe-comment style, or `prefix="<!-- ", suffix=" -->"`
+    for HTML's block-comment style.
+    """
+    return '%sSYNTAX TEST "%s"%s\n' % (prefix, syntax_uri, suffix)
+
+
+HEADER = header_for("Packages/Python/Python.sublime-syntax")
+HEADER_PIPE_MD = header_for(
+    "Packages/Markdown/Markdown.sublime-syntax", prefix="| "
+)
+HEADER_HTML_COMMENT = header_for(
+    "Packages/HTML/HTML.sublime-syntax", prefix="<!-- ", suffix=" -->"
+)
 
 
 def _post(payload, timeout=65):
