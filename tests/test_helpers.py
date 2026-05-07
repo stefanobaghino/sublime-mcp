@@ -1570,6 +1570,211 @@ class TestTempPackagesLink(HelperTestBase):
         self.assertFalse(os.path.lexists(stale_link))
 
 
+class TestTempUserPackagesDir(HelperTestBase):
+    """`temp_user_packages_dir` synthesises a managed
+    `Packages/User/__sublime_mcp_user_<prefix>_<nonce>__/` directory
+    and returns its absolute path. `release_user_packages_dir` tears
+    it down with structural validation. Productizes the cross-syntax
+    workaround documented in #108 (#118) — same lifecycle shape as
+    `temp_packages_link` but on the `Packages/User/` ingest path that
+    actually feeds ST's parse-table builder for cross-syntax
+    references.
+    """
+
+    USER_PREFIX = "__sublime_mcp_user_"
+    USER_SUFFIX = "__"
+
+    def _defensive_user_sweep(self):
+        # Same shape as TestTempPackagesLink._defensive_link_sweep:
+        # any leftover nonce-named dir gets removed regardless of age
+        # so a crash in a prior test doesn't poison this one.
+        user_dir = os.path.join(sublime.packages_path(), "User")
+        try:
+            entries = os.listdir(user_dir)
+        except OSError:
+            return
+        for name in entries:
+            if name.startswith(self.USER_PREFIX) and name.endswith(self.USER_SUFFIX):
+                shutil.rmtree(os.path.join(user_dir, name), ignore_errors=True)
+
+    def _release(self, path):
+        # Cleanup helper for tests that successfully create a dir.
+        # Tolerates a missing dir in case the test already cleaned up.
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+
+    def setUp(self):
+        self._defensive_user_sweep()
+
+    def test_creates_dir_with_user_prefix(self):
+        code = (
+            "_ = temp_user_packages_dir()\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path = outcome["output"].strip()
+        self.addCleanup(self._release, path)
+        self.assertTrue(os.path.isdir(path))
+        self.assertFalse(os.path.islink(path))
+        name = os.path.basename(path)
+        self.assertTrue(name.startswith(self.USER_PREFIX), name)
+        self.assertTrue(name.endswith(self.USER_SUFFIX), name)
+        # Default prefix segment is "probe".
+        self.assertIn("_probe_", name)
+        # Lives under Packages/User/, not Packages/.
+        expected_parent = os.path.join(sublime.packages_path(), "User")
+        self.assertEqual(os.path.dirname(path), expected_parent)
+
+    def test_custom_prefix_appears_in_name(self):
+        code = (
+            "_ = temp_user_packages_dir('q1-extends')\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path = outcome["output"].strip()
+        self.addCleanup(self._release, path)
+        self.assertIn("_q1-extends_", os.path.basename(path))
+
+    def test_directory_is_writable(self):
+        # The point of this helper is to give the caller a place to
+        # write `.sublime-syntax` files; smoke-test that an open() and
+        # find_resources round-trips through the dir.
+        code = (
+            "import os\n"
+            "path = temp_user_packages_dir()\n"
+            "with open(os.path.join(path, 'X.sublime-syntax'), 'w') as f:\n"
+            "    f.write('%YAML 1.2\\n---\\nname: X\\nscope: source.x\\ncontexts: {main: []}\\n')\n"
+            "found = wait_for_resource('X.sublime-syntax')\n"
+            "import json\n"
+            "_ = json.dumps([path, found])\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path, found = json.loads(outcome["output"].strip())
+        self.addCleanup(self._release, path)
+        self.assertTrue(found, "X.sublime-syntax should surface via wait_for_resource")
+
+    def test_release_removes_dir(self):
+        code = (
+            "path = temp_user_packages_dir()\n"
+            "release_user_packages_dir(path)\n"
+            "print(path)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path = outcome["output"].strip()
+        self.assertFalse(os.path.exists(path))
+
+    def test_release_idempotent_on_missing(self):
+        # Second release on the same path is a no-op — caller code
+        # using try/finally shouldn't need to track whether the dir
+        # was already removed by a sibling sweep.
+        code = (
+            "path = temp_user_packages_dir()\n"
+            "release_user_packages_dir(path)\n"
+            "release_user_packages_dir(path)\n"
+            "print('ok')\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "ok")
+
+    def test_release_refuses_non_managed_path(self):
+        # Pointing release at a real Packages/User/<subdir>/ would
+        # rmtree it; structural refusal is the safety guarantee.
+        code = (
+            "import os\n"
+            "target = os.path.join(sublime.packages_path(), 'User', 'NotManaged')\n"
+            "release_user_packages_dir(target)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("ValueError", outcome["error"])
+        self.assertIn("non-temp", outcome["error"])
+
+    def test_release_refuses_symlink(self):
+        # A symlink whose basename happens to match the prefix scheme
+        # could redirect the rmtree outside Packages/User/. Defence:
+        # release refuses anything that isn't a real directory.
+        link_target = tempfile.mkdtemp(prefix="sublime_mcp_test_link_target_")
+        self.addCleanup(shutil.rmtree, link_target, ignore_errors=True)
+        link_name = "%sevil_aaaaaaaaaaaa%s" % (self.USER_PREFIX, self.USER_SUFFIX)
+        link_path = os.path.join(sublime.packages_path(), "User", link_name)
+        if os.path.lexists(link_path):
+            os.unlink(link_path)
+        os.symlink(link_target, link_path)
+        self.addCleanup(
+            lambda: os.path.lexists(link_path) and os.unlink(link_path)
+        )
+        code = (
+            "release_user_packages_dir(%r)\n"
+        ) % link_path
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNotNone(outcome["error"])
+        self.assertIn("RuntimeError", outcome["error"])
+        # link_target must still exist; the helper refused the rmtree.
+        self.assertTrue(os.path.isdir(link_target))
+
+    def test_invalid_prefix_raises(self):
+        # Empty prefix, prefix with disallowed characters (underscore
+        # would collide with the structural delimiter).
+        for bad in ("", "with_underscore", "spaces here", "dot.notation"):
+            code = "temp_user_packages_dir(%r)\n" % bad
+            resp = yield from _call_tool_yielding(code)
+            outcome = _outcome(resp)
+            self.assertIsNotNone(outcome["error"], "expected raise on prefix=%r" % bad)
+            self.assertIn("ValueError", outcome["error"])
+
+    def test_stale_dir_swept_on_next_call(self):
+        # Plant a stale managed dir with mtime 90 s in the past, then
+        # call temp_user_packages_dir; the head-of-call sweep should
+        # remove the planted dir before creating the new one.
+        stale_name = "%sstale_aaaaaaaaaaaa%s" % (self.USER_PREFIX, self.USER_SUFFIX)
+        stale_path = os.path.join(sublime.packages_path(), "User", stale_name)
+        os.makedirs(stale_path, exist_ok=True)
+        old = time.time() - 90.0
+        os.utime(stale_path, (old, old))
+        self.addCleanup(shutil.rmtree, stale_path, ignore_errors=True)
+        code = (
+            "_ = temp_user_packages_dir()\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path = outcome["output"].strip()
+        self.addCleanup(self._release, path)
+        self.assertFalse(os.path.exists(stale_path))
+
+    def test_fresh_dir_not_swept(self):
+        # A managed dir with a recent mtime survives the next call's
+        # sweep — the threshold protects in-flight concurrent probes.
+        fresh_name = "%sfresh_aaaaaaaaaaaa%s" % (self.USER_PREFIX, self.USER_SUFFIX)
+        fresh_path = os.path.join(sublime.packages_path(), "User", fresh_name)
+        os.makedirs(fresh_path, exist_ok=True)
+        self.addCleanup(shutil.rmtree, fresh_path, ignore_errors=True)
+        code = (
+            "_ = temp_user_packages_dir()\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        path = outcome["output"].strip()
+        self.addCleanup(self._release, path)
+        self.assertTrue(os.path.exists(fresh_path))
+
+
 class TestProbeScopes(HelperTestBase):
     """`probe_scopes` opens a scratch view, assigns a syntax (existing
     `Packages/...` URI or synthesised inline from `syntax_yaml`),
