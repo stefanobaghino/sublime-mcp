@@ -2228,6 +2228,205 @@ class TestDumpBytes(HelperTestBase):
         self.assertIn("expected str", outcome["output"])
 
 
+class TestPreflightWedgeCheck(HelperTestBase):
+    """`preflight_wedge_check` is the static lint for known-wedge
+    synthetic-syntax shapes (#103). Returns a list of warning dicts
+    on the public surface; raises `WedgeShape` on `strict=True`.
+    The lint also runs automatically inside `temp_packages_link`,
+    where it logs warnings without aborting.
+    """
+
+    CLEAN_YAML = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: PreflightClean\n"
+        "scope: source.preflight.clean\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: 'a'\n"
+        "      scope: keyword\n"
+    )
+
+    DUPLICATE_INCLUDE_YAML = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: PreflightDupInclude\n"
+        "scope: source.preflight.dup\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - include: scope:source.host#frag1\n"
+        "    - match: 'b'\n"
+        "      scope: keyword\n"
+        "    - include: scope:source.host#frag2\n"
+    )
+
+    ZERO_WIDTH_PUSH_YAML = (
+        "%YAML 1.2\n"
+        "---\n"
+        "name: PreflightZeroWidth\n"
+        "scope: source.preflight.zwp\n"
+        "contexts:\n"
+        "  main:\n"
+        "    - match: '(?=foo)'\n"
+        "      push: pushed_ctx\n"
+        "  pushed_ctx:\n"
+        "    - match: 'foo'\n"
+        "      pop: true\n"
+    )
+
+    def test_clean_yaml_returns_no_warnings(self):
+        code = (
+            "import json\n"
+            "_ = json.dumps(preflight_wedge_check(%r))\n"
+            "print(_)\n"
+        ) % self.CLEAN_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(json.loads(outcome["output"].strip()), [])
+
+    def test_detects_duplicate_cross_scope_include(self):
+        # Shape #103 / 2: same `include: scope:<base>` referenced
+        # twice in one syntax. Detector ignores fragment differences;
+        # the wedge is on the base.
+        code = (
+            "import json\n"
+            "_ = json.dumps(preflight_wedge_check(%r))\n"
+            "print(_)\n"
+        ) % self.DUPLICATE_INCLUDE_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        warnings = json.loads(outcome["output"].strip())
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["shape"], "duplicate-cross-scope-include")
+        self.assertIn("source.host", warnings[0]["message"])
+        self.assertIn("#103 shape 2", warnings[0]["message"])
+
+    def test_detects_zero_width_match_with_push(self):
+        # Narrow form of #103 shape 1: a rule whose `match:` value is
+        # purely a lookahead expression paired with `push:`.
+        code = (
+            "import json\n"
+            "_ = json.dumps(preflight_wedge_check(%r))\n"
+            "print(_)\n"
+        ) % self.ZERO_WIDTH_PUSH_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        warnings = json.loads(outcome["output"].strip())
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["shape"], "zero-width-match-with-push")
+        self.assertIn("#103 shape 1", warnings[0]["message"])
+        self.assertIsNotNone(warnings[0]["line"])
+
+    def test_no_misfire_on_consuming_match_with_push(self):
+        # A consuming match value paired with push is the everyday
+        # shape — must not trip the zero-width detector. Locks in the
+        # false-positive boundary for the narrow heuristic.
+        yaml = (
+            "%YAML 1.2\n"
+            "---\n"
+            "name: ConsumingPush\n"
+            "scope: source.preflight.consume\n"
+            "contexts:\n"
+            "  main:\n"
+            "    - match: 'foo'\n"
+            "      push: pushed_ctx\n"
+            "  pushed_ctx:\n"
+            "    - match: 'bar'\n"
+            "      pop: true\n"
+        )
+        code = (
+            "import json\n"
+            "_ = json.dumps(preflight_wedge_check(%r))\n"
+            "print(_)\n"
+        ) % yaml
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(json.loads(outcome["output"].strip()), [])
+
+    def test_strict_mode_raises_wedge_shape(self):
+        # `strict=True` raises rather than returns; the warnings list
+        # is on the exception's `warnings` attribute so callers can
+        # introspect without re-running the check.
+        code = (
+            "try:\n"
+            "    preflight_wedge_check(%r, strict=True)\n"
+            "    print('did not raise')\n"
+            "except WedgeShape as e:\n"
+            "    print('raised', len(e.warnings))\n"
+        ) % self.DUPLICATE_INCLUDE_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "raised 1")
+
+    def test_strict_mode_does_not_raise_on_clean_yaml(self):
+        # Clean YAML must not raise even in strict mode — `WedgeShape`
+        # is reserved for actual warnings, not "the lint ran".
+        code = (
+            "preflight_wedge_check(%r, strict=True)\n"
+            "print('ok')\n"
+        ) % self.CLEAN_YAML
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "ok")
+
+    def test_rejects_non_string_input(self):
+        code = (
+            "try:\n"
+            "    preflight_wedge_check(b'not str')\n"
+            "except TypeError as e:\n"
+            "    print('raised', e)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertTrue(outcome["output"].strip().startswith("raised "))
+        self.assertIn("expected str", outcome["output"])
+
+    def test_temp_packages_link_logs_warnings_for_wedging_input(self):
+        # Integration: a directory containing a wedging syntax. The
+        # link is still created (the lint is advisory), but the
+        # warning must reach the in-process logger via the
+        # `[bridge]` shape — captured here by patching the helper's
+        # logger handler so the test sees the messages without
+        # depending on the live MCP bridge stderr.
+        target_dir = tempfile.mkdtemp(prefix="sublime_mcp_test_preflight_")
+        self.addCleanup(shutil.rmtree, target_dir, ignore_errors=True)
+        with open(os.path.join(target_dir, "Wedge.sublime-syntax"), "w") as f:
+            f.write(self.DUPLICATE_INCLUDE_YAML)
+        code = (
+            "import logging\n"
+            "captured = []\n"
+            "class _Handler(logging.Handler):\n"
+            "    def emit(self, record):\n"
+            "        captured.append(record.getMessage())\n"
+            "h = _Handler(level=logging.WARNING)\n"
+            "_log_local = logging.getLogger('sublime_mcp.bridge')\n"
+            "_log_local.addHandler(h)\n"
+            "try:\n"
+            "    name = temp_packages_link(%r)\n"
+            "finally:\n"
+            "    _log_local.removeHandler(h)\n"
+            "release_packages_link(name)\n"
+            "import json\n"
+            "_ = json.dumps([m for m in captured if 'preflight' in m])\n"
+            "print(_)\n"
+        ) % target_dir
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        messages = json.loads(outcome["output"].strip())
+        self.assertTrue(messages, "expected at least one preflight warning")
+        joined = " ".join(messages)
+        self.assertIn("duplicate-cross-scope-include", joined)
+        self.assertIn("Wedge.sublime-syntax", joined)
+
+
 class TestReloadSyntax(HelperTestBase):
     """`reload_syntax` re-binds the resource path on every view whose
     `settings()["syntax"]` matches; views bound to other syntaxes are
