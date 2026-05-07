@@ -174,7 +174,7 @@ the shim is the supported user path.
 
 ```sh
 claude mcp remove sublime-text --scope user
-docker images --filter "label=sublime-mcp-harness-image" -q | xargs -r docker image rm
+docker image rm sublime-mcp:local
 ```
 
 The shim itself is just a file in your checkout — there's nothing on

@@ -24,5 +24,13 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+# Forward log-config env vars to the container if set in the parent
+# (the shim's caller — typically Claude Code, which sets these via
+# `claude mcp add -e KEY=VALUE`). The bare `-e VAR` form passes the
+# variable through if defined; `docker run` ignores it otherwise.
+ENV_ARGS=
+[ -n "${SUBLIME_MCP_LOG_LEVEL:-}" ] && ENV_ARGS="$ENV_ARGS -e SUBLIME_MCP_LOG_LEVEL"
+[ -n "${SUBLIME_MCP_LOG_FILE:-}" ] && ENV_ARGS="$ENV_ARGS -e SUBLIME_MCP_LOG_FILE"
+
 (cd "$DIR" && docker build -q -t "$TAG" .) >/dev/null
-exec docker run -i --rm $RUN_ARGS "$TAG"
+exec docker run -i --rm $ENV_ARGS $RUN_ARGS "$TAG"

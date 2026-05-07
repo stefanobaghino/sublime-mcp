@@ -59,7 +59,7 @@ The shim writes diagnostics to stderr; Claude Code surfaces them in the MCP conn
 
 ### `docker ps` shows the container but tool calls hang
 
-The plugin host inside the container is wedged. Restart the agent session (closing it tells `dockerd` to reap the container); a fresh one will spawn a new container.
+The plugin host inside the container is wedged. The skill ships an in-agent recovery toolkit — see SKILL.md §3.2 (`health_check`), §3.3 (`inspect_environment`), §3.4 (`restart_st`), and the §4 *Recover from a wedged main thread* escalation flow. As a final fallback when `restart_st` itself fails, `docker kill <cid>` from the host (the `container_id` is echoed in every `exec_sublime_python` response) and `/mcp` re-open spawns a fresh container.
 
 ### Multi-agent
 
