@@ -16,7 +16,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # GTK + locales are the same dependency set SublimeText/UnitTesting's
 # Docker image uses for headless ST. Xvfb provides the virtual display;
-# psmisc gives `pkill` (used by the entrypoint's shutdown trap).
+# psmisc gives `pkill` (used by the entrypoint's shutdown trap and by
+# bridge.py's `restart_st`). `x11-utils` (xdpyinfo, xwininfo, xprop) and
+# `xdotool` give the bridge and snippets a way to inspect / interact with
+# the headless display when an invisible dialog is suspected (#75) — both
+# packages combined are <5 MB.
 #
 # The sed swaps the deb822 sources to azure.archive.ubuntu.com: GitHub's
 # Linux runners are Azure VMs and the runner OS itself already points
@@ -35,6 +39,8 @@ RUN sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|htt
         locales-all \
         psmisc \
         python3 \
+        x11-utils \
+        xdotool \
         xvfb \
  && rm -rf /var/lib/apt/lists/*
 
