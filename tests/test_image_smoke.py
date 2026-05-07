@@ -125,7 +125,80 @@ def run() -> int:
         output = (outcome.get("output") or "").strip()
         assert output.isdigit(), outcome
         assert int(output) >= 4000, outcome  # ST 4 build
-        print("PASS: image round-trips, ST build %s" % output)
+
+        # tools/list — bridge injects inspect_environment + restart_st
+        # alongside the plugin-owned exec_sublime_python + health_check.
+        _send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        resp = _recv(proc, timeout_s=10.0)
+        assert resp.get("id") == 3, resp
+        tools = resp.get("result", {}).get("tools") or []
+        names = {t.get("name") for t in tools}
+        for required in ("exec_sublime_python", "health_check",
+                         "inspect_environment", "restart_st"):
+            assert required in names, (required, names)
+
+        # inspect_environment — bridge-owned, runs even with ST main wedged.
+        # Healthy container should report the plugin HTTP server listening
+        # and Xvfb reachable.
+        _send(proc, {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "inspect_environment", "arguments": {}},
+        })
+        resp = _recv(proc, timeout_s=10.0)
+        assert resp.get("id") == 4, resp
+        content = resp.get("result", {}).get("content") or []
+        assert content and content[0].get("type") == "text", resp
+        env = json.loads(content[0]["text"])
+        for key in ("bridge_pid", "sublime_text_pids", "plugin_host_pid",
+                    "xvfb_pid", "http_server_listening", "display_reachable",
+                    "x_windows", "container_id", "workspace_path", "uptime_s"):
+            assert key in env, (key, env)
+        assert env["http_server_listening"] is True, env
+        assert env["display_reachable"] is True, env
+        assert env["sublime_text_pids"], env
+        plugin_host_before = env["plugin_host_pid"]
+        assert plugin_host_before is not None, env
+
+        # restart_st — kills ST + plugin host, relaunches subl --stay,
+        # waits for the HTTP server to come back. Gives ~60 s for the
+        # 30 s-timeout primitive plus margin for slow CI runners.
+        _send(proc, {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "restart_st", "arguments": {}},
+        })
+        resp = _recv(proc, timeout_s=60.0)
+        assert resp.get("id") == 5, resp
+        content = resp.get("result", {}).get("content") or []
+        assert content and content[0].get("type") == "text", resp
+        restart = json.loads(content[0]["text"])
+        assert restart.get("success") is True, restart
+        assert restart.get("plugin_host_pid_after") is not None, restart
+        assert restart["plugin_host_pid_after"] != plugin_host_before, restart
+
+        # Round-trip a trivial snippet against the rebuilt ST.
+        _send(proc, {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "exec_sublime_python",
+                "arguments": {"code": "print(sublime.version())"},
+            },
+        })
+        resp = _recv(proc, timeout_s=30.0)
+        assert resp.get("id") == 6, resp
+        content = resp.get("result", {}).get("content") or []
+        outcome = json.loads(content[0]["text"])
+        output = (outcome.get("output") or "").strip()
+        assert output.isdigit() and int(output) >= 4000, outcome
+
+        print("PASS: image round-trips, ST build %s, restart_st cycles plugin host (%s -> %s)" % (
+            output, plugin_host_before, restart["plugin_host_pid_after"],
+        ))
         return 0
     finally:
         if proc.poll() is None:
