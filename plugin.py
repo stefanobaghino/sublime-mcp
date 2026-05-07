@@ -248,7 +248,7 @@ them in `run_on_main(...)`. The following names are preloaded:
   be the right default). The header inside `content` chooses the
   syntax under test; the syntax must already be reachable.
 - `probe_scopes(content, syntax_path=None, syntax_yaml=None,
-  points=None, rstrip_scopes=True) -> dict` — scratch-view scope
+  points=None, rstrip_scopes=False) -> dict` — scratch-view scope
   sweep for "what scopes does ST emit at these points?" probes.
   Opens a scratch view, assigns a syntax (existing
   `Packages/...` URI / filesystem path under `packages_path()`,
@@ -1681,7 +1681,7 @@ def _check_case3_silent_fallback(scopes, declared_base, syntax_uri):
 
 
 def probe_scopes(content, syntax_path=None, syntax_yaml=None,
-                 points=None, rstrip_scopes=True):
+                 points=None, rstrip_scopes=False):
     # Open a scratch view, assign a syntax (existing or synthesised
     # from `syntax_yaml`), append `content`, sweep `view.scope_name(p)`
     # at every point (or just `points`), capture token list via
