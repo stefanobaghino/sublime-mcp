@@ -289,6 +289,13 @@ them in `run_on_main(...)`. The following names are preloaded:
   (e.g. after an external edit via symlink).
 - `find_resources(pattern) -> list[str]` — wraps
   `sublime.find_resources(pattern)`.
+- `dump_bytes(value) -> str` — render `value` (str / bytes /
+  bytearray) as a hex digest that survives repr -> JSON cleanly
+  (#115). Use inside a snippet for byte-exact questions like
+  "did ST normalise this byte sequence?" — `repr()` plus JSON
+  doubling makes a real tab (0x09) and the literal `\\` + `t`
+  visually identical at the agent surface; hex output is
+  unambiguous and trivially recoverable via `bytes.fromhex`.
 - `open_view(path) -> sublime.View` — opens the file, polls
   `is_loading()` up to 5 s, returns the View.
 - `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None`
@@ -941,6 +948,27 @@ def reload_syntax(resource_path):
 
 def find_resources(pattern):
     return list(sublime.find_resources(pattern))
+
+
+def dump_bytes(value):
+    # Render `value` (str / bytes / bytearray) as a hex digest that
+    # survives the repr -> JSON round-trip cleanly (#115). The
+    # `result` channel runs values through `repr()` and the JSON
+    # transport then doubles backslashes; a real tab (0x09) and the
+    # two-byte sequence `\` + `t` produce visually-identical agent-
+    # side strings, indistinguishable without length arithmetic.
+    # Use this helper inside a snippet — `print(dump_bytes(scope))`
+    # — for byte-exact questions like "did ST normalise this byte
+    # sequence?" Hex output round-trips through JSON unchanged
+    # (printable ASCII, no escapes) and is trivially recoverable
+    # via `bytes.fromhex(hex).decode("utf-8")` on the agent side.
+    if isinstance(value, str):
+        return value.encode("utf-8").hex()
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).hex()
+    raise TypeError(
+        "dump_bytes: expected str / bytes / bytearray, got %s" % type(value).__name__
+    )
 
 
 def run_on_main(callable_, timeout=2.0):
