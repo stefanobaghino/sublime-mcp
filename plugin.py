@@ -1455,6 +1455,112 @@ def release_packages_link(name):
     _os.unlink(link_path)
 
 
+_USER_DIR_PREFIX = "__sublime_mcp_user_"
+_USER_DIR_SUFFIX = "__"
+_USER_DIR_PREFIX_PATTERN = _re.compile(r"\A[A-Za-z0-9-]+\Z")
+
+
+def _sweep_stale_user_packages_dirs():
+    # Cross-call defensive cleanup for temp_user_packages_dir: SIGKILL
+    # / OS panic bypass the within-call try/finally. Same shape as
+    # _sweep_stale_temp_dirs but on the distinct user-prefix scheme so
+    # the two pools don't collide. Removes orphans older than the same
+    # max-age threshold as the other sweeps.
+    user_dir = _os.path.join(sublime.packages_path(), "User")
+    try:
+        entries = _os.listdir(user_dir)
+    except OSError:
+        return
+    now = _time.time()
+    swept = 0
+    for name in entries:
+        if not (name.startswith(_USER_DIR_PREFIX) and name.endswith(_USER_DIR_SUFFIX)):
+            continue
+        full = _os.path.join(user_dir, name)
+        try:
+            age = now - _os.path.getmtime(full)
+        except OSError:
+            continue
+        if age < _TEMP_DIR_MAX_AGE_SECONDS:
+            continue
+        import shutil as _shutil
+        _shutil.rmtree(full, ignore_errors=True)
+        _log.info("swept stale user_dir name=%s age=%.1fs", name, age)
+        swept += 1
+    if swept:
+        _log.debug("_sweep_stale_user_packages_dirs swept count=%d", swept)
+
+
+def temp_user_packages_dir(prefix="probe"):
+    # Productize the #108 cross-syntax workaround (#118): synthesise a
+    # nonce'd `Packages/User/__sublime_mcp_user_<prefix>_<nonce>__/`
+    # directory and return its absolute filesystem path. Pair with
+    # `release_user_packages_dir(path)` for explicit teardown.
+    #
+    # Why this rather than `temp_packages_link`: cross-syntax
+    # references inside a linked syntax (`push: scope:` / `set:` /
+    # `embed:` / `include:` against `scope:source.X` and file-path
+    # forms) silently fall back to Plain Text under
+    # `temp_packages_link` (#108). The `Packages/User/<subdir>/`
+    # ingest path *does* feed ST's parse-table builder for
+    # cross-syntax references, so it's the documented path for any
+    # cross-syntax probing; this helper owns its lifecycle.
+    #
+    # Mirrors `temp_packages_link`'s shape: cross-call sweep of
+    # SIGKILL-orphaned dirs older than 60 s at entry, structural
+    # refusal of non-managed paths in release. Does NOT poll for
+    # scope-registry registration — compose with `wait_for_scope`
+    # after writing the syntax files. Each helper has one job; the
+    # asymmetric failure modes (write failed vs ingest race vs scope
+    # never registered) are easier to diagnose when the caller can
+    # see which step failed.
+    #
+    # `prefix` becomes a human-readable segment of the dir name —
+    # useful for telling SIGKILL-orphaned dirs apart by purpose.
+    # Constrained to `[A-Za-z0-9-]+` so the structural-refusal scheme
+    # in release stays robust (no underscores: those collide with the
+    # `_<nonce>__` suffix delimiter).
+    if not isinstance(prefix, str) or not _USER_DIR_PREFIX_PATTERN.match(prefix):
+        raise ValueError(
+            "temp_user_packages_dir: prefix must match [A-Za-z0-9-]+ "
+            "(got %r)" % (prefix,)
+        )
+    import uuid as _uuid
+    _sweep_stale_user_packages_dirs()
+    nonce = _uuid.uuid4().hex[:12]
+    name = "%s%s_%s%s" % (
+        _USER_DIR_PREFIX, prefix, nonce, _USER_DIR_SUFFIX
+    )
+    full = _os.path.join(sublime.packages_path(), "User", name)
+    _os.makedirs(full)
+    _log.info("temp_user_packages_dir: created name=%s", name)
+    return full
+
+
+def release_user_packages_dir(path):
+    # Companion teardown for temp_user_packages_dir. Idempotent: a
+    # missing dir is not an error (the cross-call sweep may have
+    # removed it). Refuses any path whose basename is outside the
+    # user-prefix/suffix scheme, so a buggy caller can't accidentally
+    # rmtree a real `Packages/User/<subdir>/`.
+    name = _os.path.basename(_os.path.normpath(path))
+    if not (name.startswith(_USER_DIR_PREFIX) and name.endswith(_USER_DIR_SUFFIX)):
+        raise ValueError(
+            "release_user_packages_dir: refusing to remove non-temp "
+            "path %r (basename %r is outside the managed scheme)"
+            % (path, name)
+        )
+    if not _os.path.exists(path):
+        return
+    if not _os.path.isdir(path) or _os.path.islink(path):
+        raise RuntimeError(
+            "release_user_packages_dir: %r is not a directory; "
+            "refusing to remove" % path
+        )
+    import shutil as _shutil
+    _shutil.rmtree(path)
+
+
 def run_inline_syntax_test(content, name):
     # Write `content` to Packages/User/<nonce>/<name>, run ST's syntax-
     # test runner against it, return the same {state, summary, output,
