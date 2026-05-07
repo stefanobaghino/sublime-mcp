@@ -147,17 +147,128 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 { "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "workspace_path": "/work", "st_version": 4200, "st_channel": "stable" }
 ```
 
-**Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Ask the user to restart the container; do not retry. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
+**Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Drive the recovery flow in §4 *Recover from a wedged main thread* rather than retrying. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
 
-**`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. Recovery requires a true container restart (use the `container_id` from a previous response: `docker kill <cid>`), then re-connect. Don't read "Reconnected" as "wedge cleared."
+**`/mcp` reconnect does not clear a wedged main thread.** Per #73 (2026-05-05): the slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. In-agent recovery is `restart_st` (§3.4); the docker-kill route (use the `container_id` from a previous response: `docker kill <cid>`) remains as a final fallback. Don't read "Reconnected" as "wedge cleared."
 
 **`/mcp` reconnect can also land on stale transport.** A `Reconnected to sublime-text.` message does not guarantee the transport has re-bound to the new container. If the next call returns `ConnectionRefusedError(61)`, the transport is still pointed at the previous container's stdio — dismiss `/mcp` and re-open (not just re-trigger) to force a re-bind. Independent of the wedge surface above: the stale-transport shape fires whenever the previous container went away (wedge recovery via `docker kill`, container OOM, container restart) and Claude Code's reconnect attempt landed before the new container was discoverable (#104). Guard pattern: after `docker kill` + reconnect, fire a single `health_check`; on `ConnectionRefusedError`, the user needs to re-open `/mcp` rather than the agent retrying.
+
+### 3.3 inspect_environment
+
+`mcp__sublime-text__inspect_environment({})` is a bridge-owned diagnostic snapshot of container-level state. Worker-thread-only on the bridge — never touches the plugin host — so it returns within ~3s even when ST main is wedged or the entire plugin host is dead. Response shape:
+
+```json
+{
+  "bridge_pid": 1,
+  "sublime_text_pids": [42],
+  "plugin_host_pid": 56,
+  "xvfb_pid": 18,
+  "http_server_listening": true,
+  "http_probe_elapsed_s": 0.05,
+  "http_probe_error": null,
+  "display_reachable": true,
+  "x_windows": "<xwininfo -root -tree, capped at ~2KB>",
+  "container_id": "<docker cid>",
+  "workspace_path": "/work",
+  "uptime_s": 142
+}
+```
+
+**Call pattern.** Use after `health_check` returns `main_thread_responsive: false` to triage *which* recovery to attempt. Read it as a decision tree:
+
+- `http_server_listening: false` → plugin host is dead (not just wedged). `health_check` would also be unreachable. Go straight to `restart_st` (§3.4).
+- `http_server_listening: true` and unexpected entries in `x_windows` (a dialog title that isn't ST's main editor window) → soft recovery first: `subprocess.run(["xdotool", "key", "Escape"], capture_output=True, timeout=5)` from an `exec_sublime_python` snippet, then `health_check` again. If main is back, continue.
+- `http_server_listening: true` and `x_windows` looks normal → wedge isn't dialog-shaped; soft recovery won't help. Use `restart_st`.
+- `display_reachable: false` → Xvfb itself is gone. `restart_st` won't help (it relaunches `subl --stay` against a missing display); ask the user to restart the container.
+
+Best-effort: any individual subprocess failure surfaces as `null` / `false` for that field; the rest of the payload still returns. The tool never raises — read each field independently.
+
+### 3.4 restart_st
+
+`mcp__sublime-text__restart_st({})` is the in-agent escape hatch for a wedge that soft recovery (§3.5 `xdotool`) doesn't clear. Bridge-owned: kills ST + plugin host (TERM, then KILL after 5s), relaunches `subl --stay <workspace>`, polls until the plugin's HTTP server is responsive again. Returns within ~30s. Response shape:
+
+```json
+{
+  "success": true,
+  "elapsed_s": 8.3,
+  "sublime_text_pids_before": [42],
+  "sublime_text_pids_after": [161],
+  "plugin_host_pid_before": 56,
+  "plugin_host_pid_after": 187,
+  "http_ready_after_s": 6.1,
+  "log_lines": ["…", "…"]
+}
+```
+
+**On success.** The new plugin host is fully reinitialised — `plugin_loaded()` ran, `health_check` should return `main_thread_responsive: true` immediately, and `exec_sublime_python` round-trips work again. Re-issue the original probe. `plugin_host_pid_before != plugin_host_pid_after` is the in-payload signal that the restart actually cycled the process.
+
+**On failure.** `success: false`, `error` carries a short message, `log_lines` shows which step got through. Common shapes:
+
+- `"sublime_text still running after KILL+3s"` — process is unkillable from PID 1's perspective (rare; typically a kernel-level zombie). Ask the user to `docker kill <cid>`.
+- `"plugin HTTP did not come back: ..."` — `subl --stay` was launched but the plugin host never started its HTTP server within 30s. Either the relaunch silently bounced off a startup dialog (check `x_windows` via `inspect_environment`) or ST hit a worse failure mode. Ask the user to `docker kill <cid>`.
+- `"subl launch failed: ..."` — `subl` binary is unavailable. Container-image bug; file an issue.
+
+**Destructive — does not preserve view state.** Open files, scratch buffers, the in-memory `_TEMP_LINKS` registry from `temp_packages_link` calls are all gone after the restart. Symlinks under `Packages/__sublime_mcp_temp_*` are reaped by the next helper invocation's lazy sweep. Don't reach for `restart_st` for ergonomics — only when a wedge is the real cause.
+
+### 3.5 X-debug binaries (`xdotool`, `xdpyinfo`, `xwininfo`, `xprop`, `xkill`)
+
+The image ships these stable Ubuntu utilities for inspecting / interacting with the Xvfb display from inside the container (#75). All are callable from `subprocess.run([...], capture_output=True, timeout=...)` inside `exec_sublime_python` — they execute on the worker thread, so they keep working when ST main is wedged.
+
+- `xdotool key Escape` / `xdotool key Return` — synthesise key events; the soft-recovery workhorse for invisible startup or modal dialogs that ST's headless build can't dismiss on its own.
+- `xdpyinfo` (exit code) — quick "is the X display reachable?" probe. Already wrapped in `inspect_environment.display_reachable`.
+- `xwininfo -root -tree` — enumerate top-level windows. Already wrapped in `inspect_environment.x_windows`; reach for it directly if you need more than the truncated 2KB snapshot.
+- `xprop -id <id>` — read window properties (`WM_CLASS`, `WM_NAME`) once a suspect window's id is known.
+- `xkill` — last-resort window kill via X protocol, before reaching for `restart_st`.
+
+Usage example (from a snippet, after `inspect_environment` flagged a candidate dialog):
+
+```python
+import subprocess
+r = subprocess.run(
+    ["xdotool", "search", "--name", ".*", "key", "Escape"],
+    capture_output=True, text=True, timeout=5,
+)
+print(r.returncode, r.stderr[:200])
+```
+
+These binaries are not on the agent's MCP surface — they're shell tools, used through `exec_sublime_python`. The bridge wrappers in §3.3 cover the common diagnostic shape.
 
 ## 4. Recipes
 
 Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`. Paths shown are container-side; the user typically mounts their working tree at `/work`.
 
 **Host-side file-write tools.** If you're driving this skill from an agent harness with its own host-side write tool (Claude Code's `Write`, Cursor's edit tool, anything similar), don't pre-write probe files to host paths and then pass those paths into `exec_sublime_python` helpers. The container only sees paths under `--mount` directories (typically `/work`) plus its own `/tmp`; anything else is invisible regardless of how the path looks on the host. The failure shape is a hang or indexer-budget timeout (the #67 / #73 surfaces), not a clean `FileNotFoundError`. Write probe files inside the snippet instead — see *Probe a synthetic case inline* and *Probe a synthetic syntax against a synthetic input* below.
+
+### Recover from a wedged main thread
+
+When `health_check` returns `main_thread_responsive: false`, walk this escalation rather than retrying main-thread snippets (every retry burns another 60s on the wedged path). The flow goes from cheapest signal to most disruptive recovery; stop at the first step that puts main back.
+
+1. **`inspect_environment`** to triage. Read `http_server_listening`, `display_reachable`, and `x_windows`:
+   - `http_server_listening: false` → plugin host is dead. Skip to step 4.
+   - `http_server_listening: true` and `x_windows` lists an unexpected window (anything not the ST editor) → likely an invisible dialog blocking main. Try step 2.
+   - `http_server_listening: true` and `x_windows` looks normal → wedge isn't dialog-shaped. Skip to step 4.
+   - `display_reachable: false` → Xvfb is gone; restart can't help. Skip to step 5.
+
+2. **Soft recovery via `xdotool`.** From an `exec_sublime_python` snippet, dismiss the dialog and check whether main came back:
+
+   ```python
+   import subprocess
+   r = subprocess.run(
+       ["xdotool", "key", "--clearmodifiers", "Escape"],
+       capture_output=True, text=True, timeout=5,
+   )
+   print(r.returncode, r.stderr[:200])
+   ```
+
+   Then call `health_check` again. If `main_thread_responsive: true`, you're done — re-issue the probe that timed out. If still wedged, try `xdotool key Return` (some dialogs only accept the default action), then re-check.
+
+3. **`xkill`-style escalation** is rarely worth the round-trip — if Escape and Return don't dismiss, jump to step 4 instead.
+
+4. **`restart_st`** for hard recovery. Returns within ~30s with `success: true` and a fresh `plugin_host_pid_after`. After success, `health_check` should return `main_thread_responsive: true` immediately. Re-issue the original probe. Open files, scratch buffers, and the in-memory `_TEMP_LINKS` registry are gone — by design.
+
+5. **`docker kill <cid>` (final fallback).** When `restart_st` returns `success: false` (process unkillable, plugin HTTP never re-bound, etc.), surface the `container_id` (from any prior response) and ask the user to `docker kill <cid>`. They re-trigger `/mcp` (re-open, not just reconnect — see §3.2 stale-transport note); the harness shim spawns a fresh container.
+
+Don't skip step 1 — guessing at the cause without `inspect_environment` wastes turns: a soft-recovery attempt against a dead plugin host doesn't help, and a `restart_st` against a working plugin host whose only problem is a dialog is unnecessarily disruptive.
 
 ### Scope at a position
 
@@ -418,9 +529,10 @@ _ = results
 
 ## 6. Known limitations / tracking
 
-_Last synced with issue state: 2026-05-06._
+_Last synced with issue state: 2026-05-07._
 
 - **Log levels are part of the contract; log line format is best-effort.** The four-level meaning (ERROR / WARNING / INFO / DEBUG) and the column positions of `req=<id>` are stable within a release line. The exact wording of individual messages and their phrasing may change between releases.
+- **#73 / #75 — wedge recovery toolkit.** Closed: detection (`health_check`, §3.2), bridge-side diagnosis (`inspect_environment`, §3.3), in-agent recovery (`restart_st`, §3.4), and the X-debug binaries the image now ships (`xdotool`, `x11-utils`, §3.5). The escalation flow lives at §4 *Recover from a wedged main thread*. Out-of-scope follow-ups (separate tickets when needed): preserving view state across `restart_st`, diagnosing *why* ST wedged in the first place, the `install.md` "restart the agent session" recipe correction.
 - **Parse-table-build silent fallback (case-3 of three).** ST sometimes registers a syntax structurally — `sublime.list_syntaxes()` shows it with the declared scope, `view.syntax().path` echoes the requested URI — but its parse-table builder rejects something deeper (e.g. an action shape ST doesn't compile, like multi-target `embed: [a, b]`), or a `push: scope:` / `embed: scope:` / `include: scope:` against an unresolvable target falls back to Plain Text inside the embedded frame. The `requested == resolved` invariant from §7 does not catch either shape. `probe_scopes` raises `RuntimeError` from a sweep-time detector that runs after the committed sweep output is in hand (post-#107 fix — the earlier point-0-only detector misfired ~25 % of the time when ST tokenisation raced the warm-up). Two shapes flagged: (a) every position bare `text.plain` under a non-plain declared base — the single-syntax variant from #78 widened to the full sweep (#107); (b) any position carrying `text.plain` as a non-leading scope element — the embed-side variant where a cross-syntax reference fell back to Plain Text whose `meta_scope` is `text.plain` (#109). For the single-position helpers (`scope_at_test`, `resolve_position`), the dict-level detection is `resolved_syntax != "Packages/Text/Plain text.tmLanguage"` AND `scope == "text.plain"` AND `sublime.syntax_from_path(resolved).scope` is non-plain — they can't construct the cross-position view (b) relies on, so their detector stays at the assigned-syntax level.
 - **#7** — parameterise the test suite's hardcoded `HEADER` across syntaxes.
 - **#8** — concurrency cap on the exec daemon-thread pool.
