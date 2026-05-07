@@ -2156,6 +2156,78 @@ class TestFindResources(HelperTestBase):
         self.assertEqual(outcome["output"].strip(), "list")
 
 
+class TestDumpBytes(HelperTestBase):
+    """`dump_bytes` returns a hex digest that survives the
+    `repr` -> JSON transport unchanged (#115). Used for byte-exact
+    questions where the `result` channel's escape-doubling makes a
+    real tab and the literal `\\` + `t` indistinguishable.
+    """
+
+    def test_distinguishes_real_tab_from_escape_sequence(self):
+        # The motivating case: a one-byte real tab (0x09) and the
+        # two-byte sequence `\` + `t` produce visually-identical
+        # repr-then-JSON output. Hex output disambiguates: 09 vs
+        # 5c74.
+        code = (
+            "print(dump_bytes('\\t'))\n"
+            "print(dump_bytes('\\\\t'))\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        lines = outcome["output"].strip().splitlines()
+        self.assertEqual(lines[0], "09")
+        self.assertEqual(lines[1], "5c74")
+
+    def test_str_input_uses_utf8(self):
+        # Multi-byte characters round-trip through UTF-8. `é` is
+        # 0xc3 0xa9 in UTF-8.
+        code = "print(dump_bytes('é'))\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "c3a9")
+
+    def test_bytes_input_passes_through(self):
+        # Bytes values render hex directly without re-encoding.
+        code = "print(dump_bytes(b'\\x00\\xff'))\n"
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertEqual(outcome["output"].strip(), "00ff")
+
+    def test_recoverable_on_agent_side(self):
+        # The contract is "agent-side recoverable via
+        # bytes.fromhex(hex).decode('utf-8')". Confirm the round-trip
+        # by asserting equality after the recover.
+        code = (
+            "import json\n"
+            "_ = json.dumps({'h': dump_bytes('hello\\tworld')})\n"
+            "print(_)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        payload = json.loads(outcome["output"].strip())
+        recovered = bytes.fromhex(payload["h"]).decode("utf-8")
+        self.assertEqual(recovered, "hello\tworld")
+
+    def test_rejects_unsupported_type(self):
+        # Catches the most common mistake (passing a list / dict
+        # directly instead of a string / bytes value).
+        code = (
+            "try:\n"
+            "    dump_bytes([1, 2, 3])\n"
+            "except TypeError as e:\n"
+            "    print('raised', e)\n"
+        )
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        self.assertTrue(outcome["output"].strip().startswith("raised "))
+        self.assertIn("expected str", outcome["output"])
+
+
 class TestReloadSyntax(HelperTestBase):
     """`reload_syntax` re-binds the resource path on every view whose
     `settings()["syntax"]` matches; views bound to other syntaxes are
