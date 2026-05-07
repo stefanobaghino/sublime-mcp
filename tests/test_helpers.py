@@ -1934,14 +1934,39 @@ class TestProbeScopes(HelperTestBase):
         self.assertEqual(set(r["scopes"].keys()), {"0", "3"})
         self.assertEqual(self._view_count(), before_views)
 
-    def test_rstrip_scopes_false_preserves_trailing_space(self):
+    def test_default_preserves_trailing_space(self):
+        # `rstrip_scopes` defaults to False (#114), so the no-arg
+        # case must behave like an explicit False — trailing
+        # whitespace from ST is preserved verbatim. The class of
+        # caller most likely to ask "does ST normalise X?" should
+        # see ST's actual output, not the helper's cleanup.
+        before_views = self._view_count()
+        code = (
+            "import json\n"
+            "r = probe_scopes('x = 1\\n', syntax_path=%r)\n"
+            "print(json.dumps(r))\n"
+        ) % self.PYTHON_SYNTAX
+        resp = yield from _call_tool_yielding(code)
+        outcome = _outcome(resp)
+        self.assertIsNone(outcome["error"], outcome.get("error"))
+        r = json.loads(outcome["output"])
+        self.assertTrue(
+            any(s.endswith(" ") for s in r["scopes"].values()),
+            "expected at least one scope to retain trailing space "
+            "with the default rstrip_scopes, got %r" % r["scopes"],
+        )
+        self.assertEqual(self._view_count(), before_views)
+
+    def test_rstrip_scopes_true_strips_trailing_space(self):
+        # Opt-in path: passing True is the ergonomic-compare mode —
+        # all scopes returned have no trailing whitespace.
         before_views = self._view_count()
         code = (
             "import json\n"
             "r = probe_scopes(\n"
             "    'x = 1\\n',\n"
             "    syntax_path=%r,\n"
-            "    rstrip_scopes=False,\n"
+            "    rstrip_scopes=True,\n"
             ")\n"
             "print(json.dumps(r))\n"
         ) % self.PYTHON_SYNTAX
@@ -1949,13 +1974,10 @@ class TestProbeScopes(HelperTestBase):
         outcome = _outcome(resp)
         self.assertIsNone(outcome["error"], outcome.get("error"))
         r = json.loads(outcome["output"])
-        # ST returns scope strings with a trailing space; at least one
-        # sweep entry should preserve it when rstrip_scopes=False.
-        self.assertTrue(
-            any(s.endswith(" ") for s in r["scopes"].values()),
-            "expected at least one scope to retain trailing space when "
-            "rstrip_scopes=False, got %r" % r["scopes"],
-        )
+        for s in r["scopes"].values():
+            self.assertEqual(s, s.rstrip(),
+                             "expected no trailing whitespace with "
+                             "rstrip_scopes=True, got %r" % s)
         self.assertEqual(self._view_count(), before_views)
 
     def test_rejects_both_syntax_args(self):
