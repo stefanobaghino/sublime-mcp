@@ -86,23 +86,7 @@ Columns: `<wall-clock ISO-8601>`  `<LEVEL>`  `<[component]>`  `req=<JSON-RPC id>
 
 ## 1.2 Capturing ST's own console output (don't bother)
 
-When ST silently rejects a `.sublime-syntax` (parse-table-build failure), the rejection reason is written to ST's in-memory console panel and **does not cross any syscall boundary the harness can intercept**. Every in-process and out-of-process surface has been verified empty:
-
-In-plugin-host:
-
-- `window.find_output_panel("console")` returns `None` even when `window.panels()` lists `'console'`. `create_output_panel("console")` produces an empty View (size 0). Variants `'output.console'`, `'exec'`, `'Console'` are all empty.
-- Redirecting `sys.stdout` / `sys.stderr` over the parse-table-build window captures zero bytes.
-- `os.dup2(2, …)` over the same window also captures zero bytes.
-
-Out-of-plugin-host:
-
-- All ST processes (daemon, plugin_host-3.3, plugin_host-3.8, crash_handler) have `fd 0/1/2 → /dev/null`. The container's `entrypoint.sh` redirection to `/var/log/sublime.log` is severed at daemonisation; that file stays 0 bytes. ST's own log directories (`/root/.config/sublime-text/Log/`, `/root/.cache/sublime-text/`) stay empty across probes.
-- `strace -f -p <daemon> -e trace=write,writev` across a parse-table-build trigger captures **zero writes to fd 1 or fd 2**. All write traffic is X11 protocol to Xvfb (fd 7 writev), eventfd sync counters (fd 5), and IPC pipe notifications (fd 10). An `LD_PRELOAD` shim filtered on stdio writes would catch nothing.
-- `sublime.log_*` toggles (`log_build_systems`, `log_commands`, `log_control_tree`, `log_fps`, `log_indexing`, `log_input`, `log_result_regex`) do not gate loader diagnostics.
-
-The console panel content lives entirely in the daemon's address space; reaching it requires daemon-internal access (gdb against in-memory state, or reverse-engineering the daemon↔plugin_host IPC framing on fd 3/4). Out of scope for harness-level helpers.
-
-If your probe needs to know *why* a syntax was rejected, fall back to differential structural probing (write a known-good control alongside the suspect form, compare which one ST resolves) and surface the observation as "rejected at some layer beyond YAML parse" without naming the layer.
+When ST silently rejects a `.sublime-syntax` (parse-table-build failure), the rejection reason is written to ST's in-memory console panel and **does not cross any syscall boundary the harness can intercept** — every in-process and out-of-process capture surface has been verified empty (panel APIs, stdio redirection, `dup2`, `strace` on all ST processes, `sublime.log_*` toggles; the full evidence lives in this section's git history). If a probe needs to know *why* a syntax was rejected, fall back to differential structural probing (write a known-good control alongside the suspect form, compare which one ST resolves) and surface the observation as "rejected at some layer beyond YAML parse" without naming the layer.
 
 ## 2. Decide whether this skill is the right call
 
@@ -137,7 +121,7 @@ The helpers split into two families. **View-driving** helpers (`scope_at`, `scop
 
 For the full helper surface, threading guarantees, and the authoritative `text_point` overflow semantics, read the tool's own `description` via `tools/list`. If this skill contradicts it, `tools/list` is right.
 
-**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. If the call hangs or times out instead of raising, the host-side-write footgun is the likely cause — same root, different shape; see §4. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
+**Paths are container-side.** Every path you pass into `exec_sublime_python` (to `scope_at`, `run_syntax_tests`, etc.) is resolved inside the container, not on the host. The user mounts host directories into the container at registration time; the recommended mount is `--mount $PWD:/work` so a host `~/Projects/foo/syntax_test_x.cs` becomes `/work/foo/syntax_test_x.cs` in calls. If a path you'd expect to resolve raises `FileNotFoundError`, check the user's mount before retrying; ask them rather than guessing the host-to-container mapping. If the call hangs or times out instead of raising, the host-side-write footgun is the likely cause — same root, different shape; see the preamble of `recipes.md`. `/tmp` is per-container scratch — safe to write synthetic syntax/input files into when the user's working tree shouldn't be touched.
 
 ### 3.2 health_check
 
@@ -147,7 +131,7 @@ For the full helper surface, threading guarantees, and the authoritative `text_p
 { "main_thread_responsive": true, "main_thread_probe_elapsed_s": 0.01, "plugin_host_pid": 2060, "uptime_s": 142, "container_id": "<docker cid>", "workspace_path": "/work", "st_version": 4200, "st_channel": "stable" }
 ```
 
-**Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Drive the recovery flow in §4 *Recover from a wedged main thread* rather than retrying. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
+**Call pattern.** When an `exec_sublime_python` call times out at 60s on something that touched the main thread (`scope_at`, `find_resources`, `open_file`, `assign_syntax_and_wait`, anything wrapped in `run_on_main`), call `health_check` *before* the next main-thread snippet. If `main_thread_responsive` is `false`, stop issuing main-thread snippets — every one will burn another 60s. Drive the recovery flow in recipes.md (*Recover from a wedged main thread*) rather than retrying. If `main_thread_responsive` is `true`, the previous timeout was about that specific snippet, not a session-wide wedge — retrying is fine.
 
 **`/mcp` reconnect does not clear a wedged main thread.** The slash-command reports `Reconnected to sublime-text.` and re-establishes the MCP transport, but the underlying ST process keeps running with the same wedged main thread — the next `set_timeout(callback, 0); event.wait(...)` still returns False. In-agent recovery is `restart_st` (§3.4); the docker-kill route (use the `container_id` from a previous response: `docker kill <cid>`) remains as a final fallback. Don't read "Reconnected" as "wedge cleared."
 
@@ -233,291 +217,24 @@ print(r.returncode, r.stderr[:200])
 
 These binaries are not on the agent's MCP surface — they're shell tools, used through `exec_sublime_python`. The bridge wrappers in §3.3 cover the common diagnostic shape.
 
-## 4. Recipes
-
-Each recipe is one `exec_sublime_python` call. Rows and columns are **0-indexed** — a test-file assertion on line 181 col 9 is `row=180, col=8`. Paths shown are container-side; the user typically mounts their working tree at `/work`.
-
-**Host-side file-write tools.** If you're driving this skill from an agent harness with its own host-side write tool (Claude Code's `Write`, Cursor's edit tool, anything similar), don't pre-write probe files to host paths and then pass those paths into `exec_sublime_python` helpers. The container only sees paths under `--mount` directories (typically `/work`) plus its own `/tmp`; anything else is invisible regardless of how the path looks on the host. The failure shape is a hang or indexer-budget timeout, not a clean `FileNotFoundError`. Write probe files inside the snippet instead — see *Probe a synthetic case inline* and *Probe a synthetic syntax against a synthetic input* below.
-
-### Recover from a wedged main thread
-
-When `health_check` returns `main_thread_responsive: false`, walk this escalation rather than retrying main-thread snippets (every retry burns another 60s on the wedged path). The flow goes from cheapest signal to most disruptive recovery; stop at the first step that puts main back.
-
-1. **`inspect_environment`** to triage. Read `http_server_listening`, `display_reachable`, and `x_windows`:
-   - `http_server_listening: false` → plugin host is dead. Skip to step 4.
-   - `http_server_listening: true` and `x_windows` lists an unexpected window (anything not the ST editor) → likely an invisible dialog blocking main. Try step 2.
-   - `http_server_listening: true` and `x_windows` looks normal → wedge isn't dialog-shaped. Skip to step 4.
-   - `display_reachable: false` → Xvfb is gone; restart can't help. Skip to step 5.
-
-2. **Soft recovery via `xdotool`.** From an `exec_sublime_python` snippet, dismiss the dialog and check whether main came back:
-
-   ```python
-   import subprocess
-   r = subprocess.run(
-       ["xdotool", "key", "--clearmodifiers", "Escape"],
-       capture_output=True, text=True, timeout=5,
-   )
-   print(r.returncode, r.stderr[:200])
-   ```
-
-   Then call `health_check` again. If `main_thread_responsive: true`, you're done — re-issue the probe that timed out. If still wedged, try `xdotool key Return` (some dialogs only accept the default action), then re-check.
-
-3. **`xkill`-style escalation** is rarely worth the round-trip — if Escape and Return don't dismiss, jump to step 4 instead.
-
-4. **`restart_st`** for hard recovery. Returns within ~30s with `success: true` and a fresh `plugin_host_pid_after`. After success, `health_check` should return `main_thread_responsive: true` immediately. Re-issue the original probe. Open files, scratch buffers, and the in-memory `_TEMP_LINKS` registry are gone — by design.
-
-5. **`docker kill <cid>` (final fallback).** When `restart_st` returns `success: false` (process unkillable, plugin HTTP never re-bound, etc.), surface the `container_id` (from any prior response) and ask the user to `docker kill <cid>`. They re-trigger `/mcp` (re-open, not just reconnect — see §3.2 stale-transport note); the harness shim spawns a fresh container.
-
-Don't skip step 1 — guessing at the cause without `inspect_environment` wastes turns: a soft-recovery attempt against a dead plugin host doesn't help, and a `restart_st` against a working plugin host whose only problem is a dialog is unnecessarily disruptive.
-
-### Scope at a position
-
-```python
-r = scope_at("/work/Packages/C#/tests/syntax_test_Generics.cs", 180, 8)
-print(r["scope"], "via", r["resolved_syntax"])
-```
-
-`scope_at` returns `{"scope": str, "resolved_syntax": str | None}`. `resolved_syntax` is the URI ST actually loaded (`view.syntax().path`) — `None` when no syntax resolved, `"Packages/Text/Plain text.tmLanguage"` when ST defaulted to Plain Text. Branch on `resolved_syntax` to detect silent fallback before treating `scope` as ground truth.
-
-**Landmine: extension-less syntax-test files** (`syntax_test_git_config`, no suffix) silently fall back to Plain Text via `scope_at` — `scope == "text.plain"` and `resolved_syntax == "Packages/Text/Plain text.tmLanguage"`. Use `scope_at_test` — it parses the `# SYNTAX TEST "Packages/..."` header and assigns that syntax before sampling.
-
-```python
-r = scope_at_test("/work/syntax_test_git_config", 71, 28)
-print(r["scope"])
-```
-
-The header parser is comment-token-agnostic — it accepts `#`, `//`, `<!--`, `;`, `--`, `|`, etc. Markdown's pipe-comment header works the same way:
-
-```python
-r = scope_at_test("/work/syntax_test_markdown.md", 12, 4)
-print(r["scope"])
-```
-
-### Run syntax tests against a file
-
-```python
-r = run_syntax_tests("/work/Packages/C#/tests/syntax_test_Generics.cs")
-print(r["summary"])
-for msg in r["failures"]:
-    print(msg)
-```
-
-Branch on `state` for the assertion-run outcome:
-
-| `state`     | meaning                                                                          | `summary` shape                                  | `failures` / `failures_structured` |
-| ----------- | -------------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------- |
-| `"passed"`  | runner completed; every assertion matched                                        | assertion-count headline                         | `[]` / `[]`                        |
-| `"failed"`  | runner completed; some assertions did not match — read `failures` for specifics  | `"FAILED: N of M assertions failed"`             | populated                          |
-
-`failures_structured[i]` is the parsed peer of `failures[i]` — `{file, row, col, error_label, expected_selector, actual: [{col_range, scope_chain}, ...]}`. The parser is best-effort: on an unexpected line shape any field can be `None` / empty and `failures[i]` remains the canonical record.
-
-When ST cannot complete the run, `run_syntax_tests` raises `RuntimeError` and the cause surfaces in the top-level `error` of the MCP response — `isError` is true. The reachable causes are: resource not yet indexed, path outside `sublime.packages_path()` (symlink it in first — see "Confirm which syntax ST assigned (and handle repo-local syntaxes)" below), and the private `sublime_api.run_syntax_test` missing on this ST build. For ground-truth questions that don't need the assertion runner, fall back to `scope_at` / `scope_at_test` or `resolve_position`.
-
-The `^` alignment rule that defines what each assertion line targets is documented under *Probe a synthetic case inline* below.
-
-### Read the scope chain via the runner's failure diagnostic
-
-When ST is headless (no window), `scope_at` / `scope_at_test` / `resolve_position` raise `RuntimeError`. The runner-driven equivalent: author a syntax test asserting against a guaranteed-failing selector at the position of interest; the runner's failure diagnostic carries the live scope chain at every column the assertion covers.
-
-```python
-r = run_inline_syntax_test(
-    '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
-    'def foo(): pass\n'
-    '#^^^ probe.scope.never\n',
-    "syntax_test_scope_probe",
-)
-chain = r["failures_structured"][0]["actual"][0]["scope_chain"]
-# -> "source.python meta.function.python keyword.declaration.function.python …"
-```
-
-Each `^` on the assertion line tests the column it sits in on the content line directly above — see *Probe a synthetic case inline* below for the alignment rule. `failures_structured[i].actual[j]` is `{col_range, scope_chain}`; the chain is ST's full hierarchical scope at that column, identical to what `scope_at` would return windowed (modulo trailing whitespace, which the parser preserves verbatim).
-
-When the syntax under test is also synthetic, pair this with `temp_packages_link` exactly as the *Probe a synthetic syntax against a synthetic input* recipe below does — the runner reads through the link the same way `resolve_position` does.
-
-Use this when ST is headless, or when `assign_syntax_and_wait` is racing the indexer (the runner doesn't go through `assign_syntax`); prefer `scope_at` / `scope_at_test` / `resolve_position` when a window is available — they accept any column directly without `^`-alignment constraints.
-
-### Probe a synthetic case inline
-
-For "what does ST do on this case?" probes against a syntax that's *already reachable to ST* — bundled, or linked into `Packages/` via `temp_packages_link` — `run_inline_syntax_test(content, name)` owns the file-write, indexing wait, runner call, and cleanup. The header inside `content` selects the syntax under test.
-
-```python
-r = run_inline_syntax_test(
-    '# SYNTAX TEST "Packages/Python/Python.sublime-syntax"\n'
-    'x = 1\n'
-    '# ^ source.python\n',
-    "syntax_test_probe",
-)
-print(r["state"], r["summary"])
-```
-
-Same `{state, summary, output, failures}` shape as `run_syntax_tests`, with one extra state `"inconclusive"` when ST never indexes the temp resource within the wait budget. The probe's temp dir is removed on every code path (within-call `try/finally`); a cross-call sweep at the start of each call cleans up SIGKILL-orphaned dirs older than 60 s.
-
-**Assertion-line `^` alignment.** Each `^` in an assertion line tests the column it sits in on the assertion line — the same column on the content line directly above. The leading columns are taken up by the comment marker (`#` ⇒ col 0 unreachable; `//` ⇒ cols 0–1 unreachable, with the conventional trailing space pushing the testable region to col 3+). Probes targeting those leading columns of the content line cannot be expressed through `^`. Pad the content with leading spaces if you need to test the leading region, or prefer the single-char `# SYNTAX TEST` header that maximises the reachable range. For "scope at point" probes that don't need assertion-runner output, prefer `scope_at` / `scope_at_test` / `resolve_position` — they accept any column directly.
-
-This helper writes only the *test file*. When the syntax under test is also synthetic, pair `temp_packages_link` (own the syntax) with `resolve_position` / `scope_at` (sample the input) — see the next recipe.
-
-### Probe a synthetic syntax against a synthetic input
-
-When *both* the syntax and the input it's probed against are synthetic — "I just authored this syntax in `/tmp`; what scope does ST assign at row R col C of this synthetic input string?" — neither `run_inline_syntax_test` (test-file only) nor the existing `temp_packages_link` recipe (existing input file) covers it on its own. Compose them: `temp_packages_link(dir)` to own the syntax, write the input under any path, sweep `resolve_position` for scope-at-point.
-
-```python
-# /tmp/probe/Foo.sublime-syntax and /tmp/probe/test.foo already written.
-input_text = "AB"
-name = temp_packages_link("/tmp/probe")          # directory form: links the dir directly
-syntax_uri = "Packages/%s/Foo.sublime-syntax" % name
-try:
-    chains = []
-    for c in range(len(input_text)):
-        r = resolve_position("/tmp/probe/test.foo", 0, c, syntax_path=syntax_uri)
-        assert r["resolved_syntax"] == r["requested_syntax"], r
-        chains.append(r["scope"])
-finally:
-    release_packages_link(name)
-_ = chains
-```
-
-`resolve_position` over `scope_at` here: it surfaces `requested_syntax` / `resolved_syntax`, so a typo in the synthetic syntax that makes ST silently fall back to Plain Text trips the assertion instead of returning misleading scopes. The input file does not need to live under the symlinked dir — `resolve_position` opens any filesystem path. Co-locating it next to the syntax (as above) is a cleanup convention, not a requirement; the link only exists so ST can resolve the synthetic syntax.
-
-**Trap when assembling the YAML inline.** `.sublime-syntax` files start with the directive `%YAML 1.2`. Do not build the file body via Python `%`-formatting — `"""%YAML 1.2\n…""" % var` raises `ValueError: unsupported format character 'Y' (0x59) at index 1` because Python parses `%Y` as an attempted format spec. Use f-strings, `str.format`, or plain string concatenation; only `%`-formatting trips the trap.
-
-For iterating one-rule variants of the same syntax, overwrite `Foo.sublime-syntax` under the link between sweeps and call `reload_syntax(syntax_uri)` to force ST to reparse — cheaper than tearing down and re-linking.
-
-When ST is headless, `resolve_position` raises — use the *Read the scope chain via the runner's failure diagnostic* recipe above to sweep scopes against synthetic syntaxes without a window. Pair it with the same `temp_packages_link` setup this recipe uses; the runner reads through the link the same way `resolve_position` does.
-
-#### Cross-syntax / multi-syntax probes
-
-The recipe above works for single-syntax probes because `view.assign_syntax(URI)` resolves the linked syntax through ST's resource indexer. **Cross-syntax references inside the linked syntax — `push: scope:source.X`, `set: scope:...`, `embed: scope:...`, `include: scope:...`, file-path forms of all four — silently fall back to Plain Text under `temp_packages_link`.** ST resolves those through a parse-table builder that doesn't pick up linked syntaxes the way the resource indexer and direct URI assignment do; every position inside the embedded region tokenises as `text.plain` (the Plain Text syntax's `meta_scope`) regardless of the guest's contributions, while the host's scopes everywhere else look correct — the result *appears* coherent, so the existing `requested == resolved` invariant doesn't trip. **`extends:` is path-based but resolved at load time through ST's resource lookup; it is not affected by this gap and works under `temp_packages_link`.**
-
-Workaround: own a managed `Packages/User/__sublime_mcp_user_<prefix>_<nonce>__/` directory via `temp_user_packages_dir`, write the syntaxes into it, then use `wait_for_scope` to gate on each guest scope surfacing in `sublime.find_syntax_by_scope`. The `Packages/User/<subdir>/` ingest path *does* feed ST's cross-syntax resolver, so `push:` / `set:` / `embed:` / `include:` against a guest scope resolve correctly. The basename-only `wait_for_resource` gate is insufficient here — the scope registry is a separate ingest from the resource indexer, so use the scope-registry helper. Note that `Packages/User/<subdir>/` itself can fail to register intermittently — `wait_for_scope`'s timeout is the right backstop.
-
-```python
-# Cross-syntax recipe: managed dir under Packages/User/, gate on the registry.
-import os
-base = temp_user_packages_dir("xsyn")  # /…/Packages/User/__sublime_mcp_user_xsyn_<nonce>__
-try:
-    with open(os.path.join(base, "Host.sublime-syntax"), "w") as f:
-        f.write(host_yaml)            # contains `push: scope:source.guest`
-    with open(os.path.join(base, "Guest.sublime-syntax"), "w") as f:
-        f.write(guest_yaml)           # `scope: source.guest`
-    assert wait_for_scope(["source.host", "source.guest"]), "guests never registered"
-    # now resolve_position / probe_scopes against the host see the guest's scopes.
-finally:
-    release_user_packages_dir(base)
-```
-
-`temp_user_packages_dir(prefix="probe", …)` productizes the workaround's lifecycle: nonce'd dir name, cross-call sweep of SIGKILL-orphaned dirs older than 60 s, `release_user_packages_dir(path)` for explicit teardown with structural refusal of non-managed paths. `wait_for_scope(scope, timeout=3.0)` accepts a single scope or an iterable — iterable form succeeds only when every scope surfaces, matching the host+guest shape above. `sublime.find_syntax_by_scope(scope)` itself returns `list[Syntax]` (typically empty or single-element), not a single `Syntax`; `wait_for_scope` bakes the truthy-context handling in.
-
-### Confirm which syntax ST assigned (and handle repo-local syntaxes)
-
-`view.assign_syntax` takes a `Packages/...` resource URI, not an arbitrary filesystem path. The older `view.set_syntax_file` has the same constraint but fails silently when given a filesystem path: `view.settings().get("syntax")` echoes the assigned absolute path, ST surfaces a "file not found" popup, `view.scope_name(...)` returns `text.plain` for every position, and the Python call doesn't raise. Prefer `assign_syntax_and_wait`.
-
-For a syntax file that lives outside ST's Packages tree (e.g. a syntect `testdata/Packages/...` copy mounted at `/work/testdata/...`), use `temp_packages_link` to manage a per-call symlink. The helper synthesises `Packages/__sublime_mcp_temp_<nonce>__`, waits for ST's resource indexer to surface the sentinel, and returns the synthesised package name. Pass the syntax's filesystem path directly to `resolve_position` / `assign_syntax_and_wait` — the helpers reverse-map filesystem inputs through any symlink in `sublime.packages_path()` to the matching `Packages/...` URI. (Constructing the URI by hand as `"Packages/%s/Java.sublime-syntax" % name` still works.) The caller tears down via `release_packages_link`.
-
-```python
-syntax_path = "/work/testdata/Packages/Java/Java.sublime-syntax"
-name = temp_packages_link(syntax_path)
-try:
-    r = resolve_position(
-        "/work/syntax_test_file", row=71, col=29,
-        syntax_path=syntax_path,
-    )
-    print(r["scope"], "overflow:", r["overflow"], "clamped:", r["clamped"])
-    assert r["resolved_syntax"] == r["requested_syntax"], r
-finally:
-    release_packages_link(name)
-```
-
-The returned dict also carries `overflow` (past-EOL request wrapped into a later row), `clamped` (past-EOF, point at `view.size()`) — mutually exclusive flags that surface a quiet `text_point` behaviour; the full semantics are in `TOOL_DESCRIPTION`'s "text_point overflow" section. `requested_syntax` echoes the `syntax_path` argument and `resolved_syntax` is `view.syntax().path` — assert they match before treating `scope` as ground truth, since `view.assign_syntax` accepts any string and silently falls through to Plain Text when the URI doesn't resolve.
-
-`temp_packages_link` synthesises a unique nonce-named package, so the bundled `Packages/Java` continues to load alongside it — `requested_syntax != resolved_syntax` still flags any silent fallback to a built-in. The per-syntax mode is sufficient for synthetic probes and single-grammar regression triage; cross-grammar investigations where the testdata grammar embeds another testdata grammar (e.g. C# embedding RegExp) need a whole-tree mirror that shadows the built-ins, tracked separately in §6.
-
-This recipe only works because the syntax is consumed via direct URI assignment. If the linked syntax contains any cross-syntax reference (`push:` / `set:` / `embed:` / `include:` against a `scope:source.X` or a file-path target), ST silently falls back to Plain Text inside the embedded region — use the *Cross-syntax / multi-syntax probes* recipe above (`temp_user_packages_dir` + `wait_for_scope`) instead.
-
-When a caller writes additional `.sublime-syntax` files into the already-linked dir between snippets — incremental probing — wait for them to surface via `wait_for_resource("MyProbe*.sublime-syntax")` from a follow-up snippet, *not* an in-snippet `find_resources` poll. An in-snippet poll that overruns `EXEC_TIMEOUT_SECONDS` is killed at the transport, but the main-thread state it touched can leave ST wedged for the rest of the session.
-
-`scope_at_test` parses the URI from the file's `SYNTAX TEST` header (conventionally `Packages/...` already) and exposes the same `requested_syntax` / `resolved_syntax` pair without needing a symlink. `run_syntax_tests` accepts any path under `sublime.packages_path()` (directly or via symlink); pair it with `temp_packages_link` to cover paths outside the Packages tree.
-
-### Compare a parser's output against ST
-
-Three-step divergence triage:
-
-```python
-# 1. What does ST report at the failing position?
-r = scope_at_test("/work/syntax_test_git_config", 71, 28)
-print(r["scope"], "via", r["resolved_syntax"])
-
-# 2. Did both engines sample the same point? (past-EOL divergence is common)
-r = resolve_position(
-    "/work/syntax_test_git_config", 71, 29,
-    syntax_path="Packages/Git Formats/Git Config.sublime-syntax",
-)
-print("overflow:", r["overflow"], "clamped:", r["clamped"], "actual:", r["actual"])
-
-# 3. Does ST's own runner agree?
-r = run_syntax_tests("/work/syntax_test_git_config")
-print(r["summary"])
-```
-
-If step 3 passes, the downstream parser diverges from ST — file the bug against the parser. If step 3 fails too, the test data itself has the issue; fix the data, not the parser.
-
-### Mutate a buffer from a snippet
-
-Snippets exec on a worker thread; `view.run_command(...)` requires ST's main thread and silently no-ops if called directly. Wrap the call in `run_on_main` — it owns the `set_timeout` schedule, the completion signal, and the timeout error path.
-
-```python
-v = sublime.active_window().new_file()
-run_on_main(lambda: v.run_command("append", {"characters": "hello"}))
-print(v.size())  # 5
-v.set_scratch(True); v.close()
-```
-
-`run_on_main(callable, timeout=2.0)` returns the callable's value; exceptions raised inside the callable propagate to the worker thread (and surface as the snippet's `error`).
-
-For the common case of synthesising a buffer purely to sweep scopes, prefer `probe_scopes(content, syntax_path=..., syntax_yaml=...)` — it bundles the lifecycle (open / assign / append / size-poll / sweep / close) and the optional synthetic-syntax cleanup, so the recipe above is only needed when the probe shape doesn't fit `probe_scopes` (e.g. incremental edits across multiple runs).
-
-`probe_scopes`'s `scopes` dict is mode-dependent: integer keys via `result` (the canonical channel — see §5 "Assign structured values to `_`"), string keys via JSON `output`. Index `r["scopes"][position]` with an `int` if you read via `_` / `result`; cast back with `int(k)` if you parsed `output` through JSON. Picking the canonical channel avoids the defensive `r["scopes"].get(str(i), r["scopes"].get(i))` boilerplate.
-
-### Bulk probes
-
-A `view.scope_name(point)` call on an already-tokenised view costs around 150 µs (measured: 5 × 500-sample medians on a 1.2k-line Python source view, ST 4200 stable). It's also thread-safe and runs concurrent with ST's UI, so a several-hundred-row sweep in one `exec_sublime_python` call comfortably fits the 60 s per-call budget — three orders of magnitude of headroom. The cold-view cost is a one-time tokenisation pass on the first helper call against a given path.
-
-```python
-scopes = [scope_at("/work/big_file", row, 0)["scope"] for row in range(3020, 3039)]
-_ = scopes  # returns via `result`
-```
-
-### Filter find_resources output through load_resource
-
-`find_resources` reports whatever ST's resource index says exists, which can lag behind reality. A path like `Packages/C#/Embeddings/Regex (for C#).sublime-syntax` may appear in the listing yet raise `FileNotFoundError` from `sublime.load_resource(...)` when the underlying file is gone (cache survives source). Filter at the call site:
-
-```python
-def _safe_load(p):
-    try:
-        sublime.load_resource(p)
-        return True
-    except FileNotFoundError:
-        return False
-
-candidates = [p for p in find_resources("*.sublime-syntax") if _safe_load(p)]
-_ = candidates
-```
-
-The filter is not pushed inside `find_resources` itself: silent filtering would mask the underlying ST behaviour and cost a `load_resource` per entry on every listing.
-
-### Probe a large syntax-test file in pieces
-
-`run_syntax_tests` drives the private `sublime_api.run_syntax_test`, which is synchronous. For files with thousands of assertions (e.g. `~14k` on a large grammar's `syntax_test_*` fixture) the runner exceeds the 60 s `EXEC_TIMEOUT_SECONDS` ceiling on `exec_sublime_python` and the call returns with `error: "exec timed out after 60s"` rather than a structured `failed` / `passed` payload. No `timeout` parameter on `run_syntax_tests` rescues this — the ceiling is on the snippet call, not the helper.
-
-When that happens, enumerate failing positions externally and probe each one:
-
-```python
-# failing_positions = [(row, col), ...] — produced separately, e.g. by
-# syntect's examples/syntest harness against the same file.
-results = [scope_at_test("/work/syntax_test_huge", r, c) for r, c in failing_positions]
-_ = results
-```
-
-`scope_at_test` reads the `# SYNTAX TEST` header and assigns the syntax once per call; the loop pays a one-time tokenisation on first call and then runs at the per-`scope_name` rate noted in *Bulk probes* above. Each call is independent of the 60 s budget.
+## 4. Recipes — in `recipes.md`
+
+The copy-paste recipes live in `recipes.md` in this skill's directory. Read the matching recipe before improvising a probe:
+
+- *Recover from a wedged main thread* — the escalation flow after `health_check` reports `main_thread_responsive: false`.
+- *Scope at a position* — `scope_at` / `scope_at_test`, including the extension-less-file Plain Text landmine.
+- *Run syntax tests against a file* — `run_syntax_tests` result contract and failure causes.
+- *Read the scope chain via the runner's failure diagnostic* — scope probing when ST is headless.
+- *Probe a synthetic case inline* — `run_inline_syntax_test` and the assertion-line `^` alignment rule.
+- *Probe a synthetic syntax against a synthetic input* — `temp_packages_link` + `resolve_position`; includes the *Cross-syntax / multi-syntax probes* sub-recipe (`temp_user_packages_dir` + `wait_for_scope`).
+- *Confirm which syntax ST assigned (and handle repo-local syntaxes)* — silent-fallback detection, repo-local symlinking.
+- *Compare a parser's output against ST* — three-step divergence triage.
+- *Mutate a buffer from a snippet* — the `run_on_main` requirement.
+- *Bulk probes* — cost model for large scope sweeps.
+- *Filter find_resources output through load_resource* — stale-index filtering.
+- *Probe a large syntax-test file in pieces* — when the runner exceeds the 60 s ceiling.
+
+Two invariants apply to every recipe: rows/cols are **0-indexed**, and all paths are container-side — host files must sit under a mount (typically `/work`), and probe files must be written from inside the snippet, never pre-written to unmounted host paths (the failure shape is a hang, not `FileNotFoundError`).
 
 ## 5. Output discipline
 
@@ -530,30 +247,13 @@ _ = results
 ## 6. Known limitations
 
 - **Log line format is best-effort.** The four-level meaning (ERROR / WARNING / INFO / DEBUG) and the column positions of `req=<id>` are stable within a release line. The exact wording of individual messages and their phrasing may change between releases.
-- **Parse-table-build silent fallback.** ST sometimes registers a syntax structurally — `sublime.list_syntaxes()` shows it with the declared scope, `view.syntax().path` echoes the requested URI — but its parse-table builder rejects something deeper (e.g. an action shape ST doesn't compile, like multi-target `embed: [a, b]`), or a `push: scope:` / `embed: scope:` / `include: scope:` against an unresolvable target falls back to Plain Text inside the embedded frame. The `requested == resolved` invariant from §7 does not catch either shape. `probe_scopes` raises `RuntimeError` from a sweep-time detector covering two shapes: (a) every position bare `text.plain` under a non-plain declared base; (b) any position carrying `text.plain` as a non-leading scope element — the embed-side variant where a cross-syntax reference fell back to Plain Text whose `meta_scope` is `text.plain`. For the single-position helpers (`scope_at_test`, `resolve_position`), the caller-side check is `requested_syntax != "Packages/Text/Plain text.tmLanguage"` AND `scope == "text.plain"` — they can't construct the cross-position view (b) relies on, so the detector stays at the assigned-syntax level.
-- **Cross-syntax references under `temp_packages_link` silently fall back to Plain Text.** Synthesised `Packages/__sublime_mcp_temp_<nonce>__/` symlinks are reachable via `find_resources` and `view.assign_syntax(URI)`, but ST's parse-table builder for cross-syntax references (`push:` / `set:` / `embed:` / `include:` against `scope:source.X` and file-path forms) doesn't pick them up — every position in the embedded region tokenises as `text.plain` while `requested == resolved` still holds on the host syntax, so the existing detectors don't trip. Workaround: own a managed dir via `temp_user_packages_dir` under `<sublime.packages_path()>/User/` and gate via `wait_for_scope`; see §4 *Cross-syntax / multi-syntax probes*. The `find_syntax_by_scope` registry itself does eventually surface linked syntaxes given enough wait, so it's not a reliable signal on its own — the parse-table builder is a separate ingest with its own failure mode.
+- **Parse-table-build silent fallback.** ST sometimes registers a syntax structurally — `sublime.list_syntaxes()` shows it with the declared scope, `view.syntax().path` echoes the requested URI — but its parse-table builder rejects something deeper (e.g. an action shape ST doesn't compile, like multi-target `embed: [a, b]`), or a `push: scope:` / `embed: scope:` / `include: scope:` against an unresolvable target falls back to Plain Text inside the embedded frame. The `requested == resolved` invariant from `helpers.md` does not catch either shape. `probe_scopes` raises `RuntimeError` from a sweep-time detector covering two shapes: (a) every position bare `text.plain` under a non-plain declared base; (b) any position carrying `text.plain` as a non-leading scope element — the embed-side variant where a cross-syntax reference fell back to Plain Text whose `meta_scope` is `text.plain`. For the single-position helpers (`scope_at_test`, `resolve_position`), the caller-side check is `requested_syntax != "Packages/Text/Plain text.tmLanguage"` AND `scope == "text.plain"` — they can't construct the cross-position view (b) relies on, so the detector stays at the assigned-syntax level.
+- **Cross-syntax references under `temp_packages_link` silently fall back to Plain Text.** Synthesised `Packages/__sublime_mcp_temp_<nonce>__/` symlinks are reachable via `find_resources` and `view.assign_syntax(URI)`, but ST's parse-table builder for cross-syntax references (`push:` / `set:` / `embed:` / `include:` against `scope:source.X` and file-path forms) doesn't pick them up — every position in the embedded region tokenises as `text.plain` while `requested == resolved` still holds on the host syntax, so the existing detectors don't trip. Workaround: own a managed dir via `temp_user_packages_dir` under `<sublime.packages_path()>/User/` and gate via `wait_for_scope`; see recipes.md *Cross-syntax / multi-syntax probes*. The `find_syntax_by_scope` registry itself does eventually surface linked syntaxes given enough wait, so it's not a reliable signal on its own — the parse-table builder is a separate ingest with its own failure mode.
 - **No whole-tree mirror.** `temp_packages_link` covers per-syntax probing, but cross-grammar investigations where one testdata grammar embeds another (e.g. C# embedding RegExp) need the testdata tree to *shadow* ST's built-ins, not coexist with them. Different lifecycle (parent symlink, per-entry shadowing); not yet implemented.
-- **`find_resources` can list stale paths.** ST's resource index can outlive the underlying file, so entries returned by `find_resources` may raise `FileNotFoundError` from `load_resource`. Filter at the call site — see §4 *Filter find_resources output through load_resource*.
+- **`find_resources` can list stale paths.** ST's resource index can outlive the underlying file, so entries returned by `find_resources` may raise `FileNotFoundError` from `load_resource`. Filter at the call site — see recipes.md *Filter find_resources output through load_resource*.
 - **`preflight_wedge_check` rule set is narrow.** Two static rules cover known-wedge synthetic-syntax shapes: duplicate cross-scope includes, and zero-width-only match paired with push. Multi-file shapes (e.g. back-to-back cross-syntax fragment includes under one link) are out of single-YAML scope; expansion is gated on a multi-file lint surface landing.
 
 ## 7. Reference — preloaded helpers
 
-- `scope_at(path, row, col) -> dict` — open file, return `{"scope", "resolved_syntax"}`. `resolved_syntax` is `view.syntax().path` (or `None`); compare against the canonical plain-text URI to detect extension-less / no-syntax fallback.
-- `scope_at_test(path, row, col) -> dict` — parse `# SYNTAX TEST` header, assign that syntax, return `{"scope", "requested_syntax", "resolved_syntax"}`. `requested_syntax != resolved_syntax` flags silent fallback to the wrong syntax. Tolerates both directions of the post-assign race (`view.syntax()` lagging `view.scope_name(...)`, and vice versa) by substituting `view.settings()["syntax"]` when `view.syntax()` is `None` and by polling `view.scope_name(point)` for ~200 ms when it returns `text.plain` under a known non-plain syntax. Persistent `text.plain` past that budget under a non-plain syntax indicates a silent fallback (parse-table build failure or similar — see #78), not a transient race.
-- `resolve_position(path, row, col, syntax_path=None) -> dict` — full position disambiguation with `overflow` / `clamped` flags; also carries `requested_syntax` / `resolved_syntax`. Tolerates both directions of the post-assign race (`view.syntax()` lagging `view.scope_name(...)`, and vice versa) by substituting `view.settings()["syntax"]` when `view.syntax()` is `None` and by polling `view.scope_name(point)` for ~200 ms when it returns `text.plain` under a known non-plain syntax. Persistent `text.plain` past that budget under a non-plain syntax indicates a silent fallback (parse-table build failure or similar — see #78), not a transient race.
-- `run_syntax_tests(path) -> dict` — run ST's built-in syntax-test runner. `{state, summary, output, failures, failures_structured}`. Path must resolve under `sublime.packages_path()` (directly or via a symlink in that directory); paths outside the Packages tree raise.
-- `run_inline_syntax_test(content, name) -> dict` — synthetic-probe variant: writes `content` to a managed temp dir under `Packages/User/`, runs the runner, cleans up. Same shape as `run_syntax_tests` plus a `"inconclusive"` state when ST never indexes the temp resource.
-- `probe_scopes(content, syntax_path=None, syntax_yaml=None, points=None, rstrip_scopes=False) -> dict` — scratch-view full-buffer scope sweep. Pass `syntax_path` to probe an already-reachable syntax (`Packages/...` URI or filesystem path under `packages_path()`), `syntax_yaml` to synthesise a grammar inline (helper writes to a managed `Packages/User/__sublime_mcp_temp_<nonce>__/` dir and removes it on exit, no `Packages/User/Probe.sublime-syntax` leak). `rstrip_scopes` defaults to `False` (#114) so the returned strings reflect ST's own whitespace handling — the helper does not silently strip; pass `True` if you want the trailing-whitespace cleanup for exact-string compares. Returns `{"scopes": {int: str}, "tokens": [...], "view_size", "syntax", "requested_syntax", "resolved_syntax"}`. `requested_syntax` (#119) is the canonical `Packages/...` URI passed to `view.assign_syntax`, mirroring `scope_at_test` / `resolve_position`, so the same `assert r["requested_syntax"] == r["resolved_syntax"]` defensive guard against silent fallback works here too; `syntax` is retained as an alias for back-compat. The `scopes` dict's key type is mode-dependent (#112) — `int` via `result` (the canonical channel, see §5); JSON serialisation stringifies them when read via `output`. Read via `_` / `result` to avoid casting; see the §4 "Mutate a buffer" callout for the canonical mode. Tolerates the post-assign race via the same `view.scope_name` warm-up shape as `scope_at_test` / `resolve_position` — single warm-up at the highest sweep point. Raises `RuntimeError` from a sweep-time case-3 silent-fallback detector (post-#107 / #109 fix) on either of two shapes: every position bare `text.plain` under a non-plain declared base (#78 / #107 single-syntax variant), or any position carrying `text.plain` as a non-leading scope element (#109 embed-side variant — the host frame looks fine, but a cross-syntax `push:` / `set:` / `embed:` / `include:` action fell back to Plain Text). See §6.
-- `open_view(path, timeout=5.0) -> View` — open a file, poll `is_loading` and initial tokenisation.
-- `assign_syntax_and_wait(view, resource_path, timeout=2.0) -> None` — assign a syntax and wait for the setting to apply + best-effort tokenisation.
-- `run_on_main(callable, timeout=2.0)` — schedule `callable` on ST's main thread; return its value (or re-raise its exception). Required wrapper for `view.run_command(...)` and other `TextCommand` mutations.
-- `temp_packages_link(filesystem_path) -> str` / `release_packages_link(name) -> None` — synthesise / tear down a per-call `Packages/__sublime_mcp_temp_<nonce>__` symlink for repo-local syntaxes. `filesystem_path` accepts either a `.sublime-syntax` file (links its parent directory) or a directory (links it directly). Returns the synthesised package name; build URIs as `Packages/<name>/<basename>`. Cross-syntax references (`push:` / `set:` / `embed:` / `include:`) inside a linked syntax silently fall back to Plain Text under the link path (#108) — use `temp_user_packages_dir` for that path instead.
-- `temp_user_packages_dir(prefix="probe") -> str` / `release_user_packages_dir(path) -> None` — synthesise / tear down a managed `Packages/User/__sublime_mcp_user_<prefix>_<nonce>__/` directory for cross-syntax probes (#118). Productizes the #108 workaround: cross-call sweep of SIGKILL-orphaned dirs older than 60 s, structural refusal of non-managed paths in release. Returns the absolute filesystem path; write `.sublime-syntax` files into it and compose with `wait_for_scope` to gate on registration. `prefix` is constrained to `[A-Za-z0-9-]+` (no underscores: those collide with the structural-refusal scheme).
-- `find_resources(pattern) -> list[str]` — wrap `sublime.find_resources`.
-- `dump_bytes(value) -> str` — render `value` (str / bytes / bytearray) as a hex digest that round-trips through `repr` → JSON unchanged (#115). Use inside a snippet for byte-exact inspection of strings whose byte content matters (`print(dump_bytes(scope))`); recover via `bytes.fromhex(hex).decode("utf-8")` on the agent side.
-- `preflight_wedge_check(yaml_text, strict=False) -> list[dict]` — static lint for known-wedge synthetic-syntax shapes (#103). Returns `[{"shape", "message", "line"}, ...]`; empty when clean. `strict=True` raises `WedgeShape` instead. Initial rules: duplicate cross-scope includes (#103 shape 2) and zero-width-only match paired with push (narrow form of #103 shape 1); the multi-file shape 3 is out of single-YAML scope. The lint also runs automatically on every `.sublime-syntax` file under a `temp_packages_link` target — warnings hit the unified log at level WARNING without aborting the link.
-- `wait_for_resource(pattern, timeout=3.0) -> bool` — poll `find_resources(pattern)` until any match surfaces or the budget expires. Use across snippets to wait for a file written in a prior `exec_sublime_python` to surface in ST's resource index — chaining cross-snippet avoids the wedge risk of in-snippet polling that overruns `EXEC_TIMEOUT_SECONDS`. `pattern` is matched as a glob against resource basenames only (`sublime.find_resources` semantics) — full `Packages/<dir>/<file>` paths never match. Raises `ValueError` if `pattern` contains `/` rather than silently returning `False` after burning the timeout (#100).
-- `wait_for_scope(scope, timeout=3.0) -> bool` — poll `sublime.find_syntax_by_scope(scope)` until every scope surfaces or the budget expires. Scope-registry counterpart of `wait_for_resource` (#117) — separate ingest from the resource indexer, required gate for cross-syntax probes (`push: scope:` / `set: scope:` / `embed: scope:` / `include: scope:`) per #108. Accepts a single scope string or an iterable; iterable form succeeds only when every scope is registered. Raises `ValueError` on an empty iterable.
-- `reload_syntax(resource_path) -> None` — force-reload a `.sublime-syntax` resource via view reactivation.
+Per-helper contracts — signatures, return shapes, race-tolerance and silent-fallback notes — live in `helpers.md` in this skill's directory (the helper names are listed in §3.1). Read `helpers.md` before relying on a helper's exact return shape or failure mode. Full signatures and threading guarantees live in `TOOL_DESCRIPTION` (read via `tools/list`); if the docs disagree, `tools/list` is right.
 
-Full signatures, gotchas, and threading guarantees live in `TOOL_DESCRIPTION` (read via `tools/list`). This reference is a cheat-sheet.
